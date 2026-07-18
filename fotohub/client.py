@@ -1,10 +1,13 @@
-"""FOTOhub API client — synchronous and asynchronous."""
+"""FOTOhub API client — synchronous and asynchronous.
+
+Covers all 29+ public API endpoints with full type annotations.
+"""
 
 from __future__ import annotations
 
 import os
 import time
-from typing import Any, Optional, Union
+from typing import Any, Generator, Optional, Union
 
 import httpx
 
@@ -18,28 +21,18 @@ from .exceptions import (
     ValidationError,
     VideoJobTimeoutError,
 )
-from .models import (
-    BucketListResponse,
-    BucketProvisionResponse,
-    ChatCompletion,
-    ChatMessage,
-    ChatRole,
-    GabrielResponse,
-    ImageGenerationResponse,
-    MusicGenerationResponse,
-    PresignedUrlResponse,
-    StorageBucket,
-    TranslationResult,
-    UsageResponse,
-    VideoJob,
-)
 from .streaming import AsyncChatStream, ChatStream
 
 DEFAULT_BASE_URL = "https://apis.fotohub.app"
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_IMAGE_MODEL = "seedream-5-0-260128"
-SDK_VERSION = "1.0.0"
+DEFAULT_VIDEO_MODEL = "veo-2"
+DEFAULT_CHAT_MODEL = "gemini-flash"
+DEFAULT_BEDROCK_MODEL = "claude-sonnet-4.6"
+DEFAULT_MUSIC_MODEL = "minimax"
+DEFAULT_SPEECH_MODEL = "google"
+SDK_VERSION = "1.2.0"
 
 
 class _BaseClient:
@@ -54,9 +47,9 @@ class _BaseClient:
         max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> None:
         self.api_key = api_key or os.environ.get("FOTOHUB_API_KEY", "")
-        self.base_url = (base_url or os.environ.get("FOTOHUB_BASE_URL", DEFAULT_BASE_URL)).rstrip(
-            "/"
-        )
+        self.base_url = (
+            base_url or os.environ.get("FOTOHUB_BASE_URL", DEFAULT_BASE_URL)
+        ).rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
 
@@ -120,15 +113,21 @@ class _BaseClient:
         return min(2**attempt * 0.5, 30.0)
 
 
+# ---------------------------------------------------------------------------
+# Synchronous Client
+# ---------------------------------------------------------------------------
+
+
 class FotoHub(_BaseClient):
     """Synchronous FOTOhub API client.
 
-    Usage:
+    Usage::
+
         from fotohub import FotoHub
 
         client = FotoHub(api_key="your-api-key")
         result = client.generate_image(prompt="A sunset over mountains")
-        print(result.images[0].url)
+        print(result["images"][0]["url"])
     """
 
     def __init__(
@@ -193,7 +192,9 @@ class FotoHub(_BaseClient):
             raise TimeoutError(message=f"Request failed after {self.max_retries} retries")
         raise FotoHubError("Unexpected retry exhaustion")
 
-    # --- Image Generation ---
+    # =========================================================================
+    # AI Generation
+    # =========================================================================
 
     def generate_image(
         self,
@@ -202,29 +203,27 @@ class FotoHub(_BaseClient):
         model: str = DEFAULT_IMAGE_MODEL,
         width: int = 1024,
         height: int = 1024,
+        aspect_ratio: str = "1:1",
         num_images: int = 1,
         negative_prompt: Optional[str] = None,
+        style: Optional[str] = None,
         seed: Optional[int] = None,
-        guidance_scale: Optional[float] = None,
-        steps: Optional[int] = None,
-        **kwargs: Any,
-    ) -> ImageGenerationResponse:
+    ) -> dict[str, Any]:
         """Generate images from a text prompt.
 
         Args:
             prompt: Text description of the desired image.
-            model: Model to use. Default: seedream-5-0-260128 (SeedDream 5.0 Lite).
-            width: Image width in pixels (default: 1024).
-            height: Image height in pixels (default: 1024).
-            num_images: Number of images to generate (default: 1).
+            model: Model to use (default: seedream-5-0-260128).
+            width: Image width in pixels.
+            height: Image height in pixels.
+            aspect_ratio: Aspect ratio string (e.g. "1:1", "16:9", "9:16").
+            num_images: Number of images to generate (1-4).
             negative_prompt: Things to avoid in the image.
+            style: Style preset (e.g. "photographic", "cinematic", "anime").
             seed: Random seed for reproducibility.
-            guidance_scale: How closely to follow the prompt (model-dependent).
-            steps: Number of diffusion steps (model-dependent).
-            **kwargs: Additional model-specific parameters.
 
         Returns:
-            ImageGenerationResponse with generated image URLs and metadata.
+            Dict with ``images`` list containing URLs, model, credits_used.
 
         Raises:
             InsufficientCreditsError: If account lacks credits.
@@ -235,396 +234,835 @@ class FotoHub(_BaseClient):
             "model": model,
             "width": width,
             "height": height,
+            "aspect_ratio": aspect_ratio,
             "num_images": num_images,
         }
         if negative_prompt is not None:
             payload["negative_prompt"] = negative_prompt
+        if style is not None:
+            payload["style"] = style
         if seed is not None:
             payload["seed"] = seed
-        if guidance_scale is not None:
-            payload["guidance_scale"] = guidance_scale
-        if steps is not None:
-            payload["steps"] = steps
-        payload.update(kwargs)
 
         response = self._request("POST", "/v1/ai/generate/image", json_data=payload)
-        return ImageGenerationResponse(**response.json())
+        return response.json()
 
-    # --- Video Generation ---
+    def edit_image(
+        self,
+        image_url: str,
+        prompt: str,
+        *,
+        mode: str = "inpaint",
+        mask_url: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Edit an existing image using AI.
+
+        Args:
+            image_url: URL of the source image.
+            prompt: Instruction for the edit.
+            mode: Edit mode — "inpaint", "outpaint", "remove_bg", "upscale", "style_transfer".
+            mask_url: URL of the mask image (required for inpaint/erase).
+            model: Model override.
+
+        Returns:
+            Dict with edited image URL and metadata.
+        """
+        payload: dict[str, Any] = {
+            "image_url": image_url,
+            "prompt": prompt,
+            "mode": mode,
+        }
+        if mask_url is not None:
+            payload["mask_url"] = mask_url
+        if model is not None:
+            payload["model"] = model
+
+        response = self._request("POST", "/v1/ai/edit/image", json_data=payload)
+        return response.json()
 
     def generate_video(
         self,
         prompt: str,
         *,
-        model: Optional[str] = None,
-        duration: Optional[float] = None,
+        model: str = DEFAULT_VIDEO_MODEL,
+        duration: int = 5,
+        aspect_ratio: str = "16:9",
         image_url: Optional[str] = None,
-        aspect_ratio: Optional[str] = None,
-        **kwargs: Any,
-    ) -> VideoJob:
+        resolution: str = "1080p",
+    ) -> dict[str, Any]:
         """Start an asynchronous video generation job.
 
         Args:
             prompt: Text description of the desired video.
-            model: Video model to use.
-            duration: Desired video duration in seconds.
-            image_url: Reference image URL for image-to-video.
-            aspect_ratio: Aspect ratio (e.g., "16:9", "9:16", "1:1").
-            **kwargs: Additional model-specific parameters.
+            model: Video model (default: veo-2).
+            duration: Desired duration in seconds.
+            aspect_ratio: Aspect ratio (e.g. "16:9", "9:16", "1:1").
+            image_url: Reference image for image-to-video generation.
+            resolution: Output resolution ("720p", "1080p", "4k").
 
         Returns:
-            VideoJob with job_id and initial status.
+            Dict with job_id and initial status.
         """
-        payload: dict[str, Any] = {"prompt": prompt}
-        if model is not None:
-            payload["model"] = model
-        if duration is not None:
-            payload["duration"] = duration
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "model": model,
+            "duration": duration,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+        }
         if image_url is not None:
             payload["image_url"] = image_url
-        if aspect_ratio is not None:
-            payload["aspect_ratio"] = aspect_ratio
-        payload.update(kwargs)
 
         response = self._request("POST", "/v1/ai/generate/video", json_data=payload)
-        return VideoJob(**response.json())
-
-    def poll_video(
-        self,
-        job_id: str,
-        *,
-        poll_interval: float = 5.0,
-        max_wait: float = 600.0,
-    ) -> VideoJob:
-        """Poll a video generation job until completion or timeout.
-
-        Args:
-            job_id: The job ID returned by generate_video().
-            poll_interval: Seconds between status checks (default: 5).
-            max_wait: Maximum seconds to wait (default: 600).
-
-        Returns:
-            VideoJob with final status and video_url (if completed).
-
-        Raises:
-            VideoJobTimeoutError: If max_wait is exceeded.
-        """
-        start_time = time.time()
-
-        while True:
-            elapsed = time.time() - start_time
-            if elapsed >= max_wait:
-                raise VideoJobTimeoutError(
-                    message=f"Video job {job_id} did not complete within {max_wait}s",
-                    job_id=job_id,
-                )
-
-            response = self._request("GET", f"/v1/ai/generate/video/{job_id}")
-            job = VideoJob(**response.json())
-
-            if job.status in ("completed", "failed"):
-                return job
-
-            time.sleep(poll_interval)
-
-    # --- Music Generation ---
+        return response.json()
 
     def generate_music(
         self,
         prompt: str,
         *,
-        model: Optional[str] = None,
-        duration: Optional[float] = None,
-        **kwargs: Any,
-    ) -> MusicGenerationResponse:
+        model: str = DEFAULT_MUSIC_MODEL,
+        duration: int = 30,
+        genre: Optional[str] = None,
+        mood: Optional[str] = None,
+        tempo: int = 120,
+        instrumental: bool = True,
+    ) -> dict[str, Any]:
         """Generate music from a text description.
 
         Args:
-            prompt: Text description of the desired music.
-            model: Music generation model to use.
-            duration: Desired duration in seconds.
-            **kwargs: Additional model-specific parameters.
+            prompt: Description of the desired music.
+            model: Music generation model (default: minimax).
+            duration: Duration in seconds (5-300).
+            genre: Genre hint (e.g. "electronic", "classical", "jazz").
+            mood: Mood hint (e.g. "happy", "melancholic", "energetic").
+            tempo: BPM (40-240, default: 120).
+            instrumental: Whether to generate instrumental-only (default: True).
 
         Returns:
-            MusicGenerationResponse with audio URL and metadata.
+            Dict with audio URL, duration, credits_used.
         """
-        payload: dict[str, Any] = {"prompt": prompt}
-        if model is not None:
-            payload["model"] = model
-        if duration is not None:
-            payload["duration"] = duration
-        payload.update(kwargs)
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "model": model,
+            "duration": duration,
+            "tempo": tempo,
+            "instrumental": instrumental,
+        }
+        if genre is not None:
+            payload["genre"] = genre
+        if mood is not None:
+            payload["mood"] = mood
 
         response = self._request("POST", "/v1/ai/generate/music", json_data=payload)
-        return MusicGenerationResponse(**response.json())
+        return response.json()
 
-    # --- Chat / LLM ---
+    def generate_sfx(
+        self,
+        prompt: str,
+        *,
+        duration: int = 5,
+    ) -> dict[str, Any]:
+        """Generate a short sound effect.
+
+        Args:
+            prompt: Description of the sound effect.
+            duration: Duration in seconds (1-30, default: 5).
+
+        Returns:
+            Dict with audio URL and metadata.
+        """
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "duration": duration,
+        }
+
+        response = self._request("POST", "/v1/ai/generate/sfx", json_data=payload)
+        return response.json()
+
+    def generate_speech(
+        self,
+        text: str,
+        *,
+        voice_id: Optional[str] = None,
+        model: str = DEFAULT_SPEECH_MODEL,
+        language: str = "pl",
+        speed: float = 1.0,
+        pitch: int = 0,
+    ) -> dict[str, Any]:
+        """Generate speech audio from text (TTS).
+
+        Args:
+            text: Text to convert to speech.
+            voice_id: Voice identifier (provider-specific).
+            model: TTS model/provider (default: "google").
+            language: Language code (default: "pl").
+            speed: Speech speed multiplier (0.5-2.0, default: 1.0).
+            pitch: Pitch adjustment in semitones (-10 to 10, default: 0).
+
+        Returns:
+            Dict with audio URL, duration, credits_used.
+        """
+        payload: dict[str, Any] = {
+            "text": text,
+            "model": model,
+            "language": language,
+            "speed": speed,
+            "pitch": pitch,
+        }
+        if voice_id is not None:
+            payload["voice_id"] = voice_id
+
+        response = self._request("POST", "/v1/ai/generate/speech", json_data=payload)
+        return response.json()
+
+    def transcribe(
+        self,
+        audio_url: str,
+        *,
+        language: str = "auto",
+    ) -> dict[str, Any]:
+        """Transcribe audio to text.
+
+        Args:
+            audio_url: URL of the audio file.
+            language: Language code or "auto" for auto-detection.
+
+        Returns:
+            Dict with transcribed text, detected language, segments.
+        """
+        payload: dict[str, Any] = {
+            "audio_url": audio_url,
+            "language": language,
+        }
+
+        response = self._request("POST", "/v1/ai/transcribe", json_data=payload)
+        return response.json()
 
     def chat(
         self,
-        messages: list[Union[dict[str, str], ChatMessage]],
+        messages: list[dict[str, str]],
         *,
-        model: Optional[str] = None,
+        model: str = DEFAULT_CHAT_MODEL,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
         stream: bool = False,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        top_p: Optional[float] = None,
-        **kwargs: Any,
-    ) -> Union[ChatCompletion, ChatStream]:
+    ) -> Union[dict[str, Any], ChatStream]:
         """Send a chat completion request (OpenAI-compatible).
 
         Args:
-            messages: List of chat messages (dicts with 'role' and 'content', or ChatMessage).
-            model: LLM model to use.
-            stream: If True, returns a ChatStream iterator.
-            temperature: Sampling temperature (0-2).
+            messages: List of message dicts with ``role`` and ``content``.
+            model: LLM model (default: gemini-flash).
+            temperature: Sampling temperature (0-2, default: 0.7).
             max_tokens: Maximum tokens in the response.
-            top_p: Nucleus sampling parameter.
-            **kwargs: Additional parameters.
+            stream: If True, returns a ChatStream iterator yielding SSE chunks.
 
         Returns:
-            ChatCompletion if stream=False, ChatStream if stream=True.
+            Dict with choices, usage if stream=False; ChatStream if stream=True.
         """
-        formatted_messages = []
-        for msg in messages:
-            if isinstance(msg, ChatMessage):
-                formatted_messages.append({"role": msg.role.value, "content": msg.content})
-            else:
-                formatted_messages.append(msg)
-
-        payload: dict[str, Any] = {"messages": formatted_messages, "stream": stream}
-        if model is not None:
-            payload["model"] = model
-        if temperature is not None:
-            payload["temperature"] = temperature
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if top_p is not None:
-            payload["top_p"] = top_p
-        payload.update(kwargs)
+        payload: dict[str, Any] = {
+            "messages": messages,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": stream,
+        }
 
         if stream:
             response = self._request("POST", "/v1/ai/chat", json_data=payload, stream=True)
             return ChatStream(response)
 
         response = self._request("POST", "/v1/ai/chat", json_data=payload)
-        return ChatCompletion(**response.json())
+        return response.json()
 
-    # --- Translation ---
-
-    def translate(
+    def chat_bedrock(
         self,
-        text: str,
+        messages: list[dict[str, str]],
         *,
-        target_language: str,
-        source_language: Optional[str] = None,
-        **kwargs: Any,
-    ) -> TranslationResult:
-        """Translate text between languages (no auth required).
+        model: str = DEFAULT_BEDROCK_MODEL,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        system: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Send a chat request via AWS Bedrock (Claude/Anthropic models).
 
         Args:
-            text: Text to translate.
-            target_language: Target language code (e.g., "en", "pl", "de").
-            source_language: Source language code (auto-detected if not provided).
-            **kwargs: Additional parameters.
+            messages: List of message dicts with ``role`` and ``content``.
+            model: Bedrock model ID (default: claude-sonnet-4.6).
+            temperature: Sampling temperature (0-1).
+            max_tokens: Maximum tokens in the response.
+            system: System prompt (prepended to conversation).
 
         Returns:
-            TranslationResult with translated text.
+            Dict with response content, usage, stop_reason.
         """
         payload: dict[str, Any] = {
-            "text": text,
-            "target_language": target_language,
+            "messages": messages,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
         }
-        if source_language is not None:
-            payload["source_language"] = source_language
-        payload.update(kwargs)
+        if system is not None:
+            payload["system"] = system
 
-        response = self._request("POST", "/v1/ai/translate", json_data=payload)
-        return TranslationResult(**response.json())
+        response = self._request("POST", "/v1/ai/chat/bedrock", json_data=payload)
+        return response.json()
 
-    # --- Gabriel (Intent Orchestration) ---
-
-    def gabriel(
+    def analyze_image(
         self,
-        message: str,
+        image_url: str,
         *,
-        context: Optional[dict[str, Any]] = None,
+        features: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """Analyze an image using vision models.
+
+        Args:
+            image_url: URL of the image to analyze.
+            features: List of analysis features (e.g. ["caption", "objects",
+                "text", "faces", "nsfw", "colors"]).
+
+        Returns:
+            Dict with analysis results keyed by feature.
+        """
+        payload: dict[str, Any] = {"image_url": image_url}
+        if features is not None:
+            payload["features"] = features
+
+        response = self._request("POST", "/v1/ai/analyze/image", json_data=payload)
+        return response.json()
+
+    def enhance_prompt(
+        self,
+        prompt: str,
+        *,
+        style: str = "photographic",
+    ) -> str:
+        """Enhance a short prompt into a detailed generation prompt.
+
+        Args:
+            prompt: Short input prompt.
+            style: Target style ("photographic", "cinematic", "illustration",
+                "3d", "anime").
+
+        Returns:
+            Enhanced prompt string.
+        """
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "style": style,
+        }
+
+        response = self._request("POST", "/v1/ai/enhance-prompt", json_data=payload)
+        data = response.json()
+        return data.get("enhanced_prompt", data.get("prompt", prompt))
+
+    # =========================================================================
+    # Stability AI Tools
+    # =========================================================================
+
+    def stability_tools(self) -> list[dict[str, Any]]:
+        """List available Stability AI tools and their capabilities.
+
+        Returns:
+            List of tool descriptors with id, name, description, parameters.
+        """
+        response = self._request("GET", "/v1/ai/stability/tools")
+        data = response.json()
+        return data.get("tools", data) if isinstance(data, dict) else data
+
+    def stability_run(
+        self,
+        tool_id: str,
+        image_base64: str,
+        *,
+        mask: Optional[str] = None,
+        prompt: Optional[str] = None,
+        reference: Optional[str] = None,
+        seed: Optional[int] = None,
+        negative_prompt: Optional[str] = None,
+        output_format: str = "png",
         **kwargs: Any,
-    ) -> GabrielResponse:
-        """Send a message to the Gabriel intent orchestration engine (no auth required).
+    ) -> dict[str, Any]:
+        """Run a Stability AI tool on an image.
 
         Args:
-            message: User message to process.
-            context: Optional context dictionary.
-            **kwargs: Additional parameters.
+            tool_id: The tool identifier (e.g. "remove-background", "upscale").
+            image_base64: Base64-encoded input image.
+            mask: Base64-encoded mask image (for inpaint/erase).
+            prompt: Text prompt (for generation-based tools).
+            reference: Base64-encoded reference image (for style transfer).
+            seed: Random seed for reproducibility.
+            negative_prompt: Things to avoid.
+            output_format: Output format ("png", "webp", "jpeg").
+            **kwargs: Additional tool-specific parameters.
 
         Returns:
-            GabrielResponse with detected intent and response.
+            Dict with output image (base64 or URL), seed, credits_used.
         """
-        payload: dict[str, Any] = {"message": message}
-        if context is not None:
-            payload["context"] = context
+        payload: dict[str, Any] = {
+            "tool_id": tool_id,
+            "image": image_base64,
+            "output_format": output_format,
+        }
+        if mask is not None:
+            payload["mask"] = mask
+        if prompt is not None:
+            payload["prompt"] = prompt
+        if reference is not None:
+            payload["reference"] = reference
+        if seed is not None:
+            payload["seed"] = seed
+        if negative_prompt is not None:
+            payload["negative_prompt"] = negative_prompt
         payload.update(kwargs)
 
-        response = self._request("POST", "/v1/ai/gabriel", json_data=payload)
-        return GabrielResponse(**response.json())
+        response = self._request("POST", "/v1/ai/stability/run", json_data=payload)
+        return response.json()
 
-    # --- Usage Analytics ---
-
-    def get_usage(
+    def stability_upscale(
         self,
+        image_base64: str,
         *,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-        category: Optional[str] = None,
-    ) -> UsageResponse:
-        """Get usage analytics for your account.
+        type: str = "fast",
+    ) -> dict[str, Any]:
+        """Upscale an image using Stability AI.
 
         Args:
-            start_date: Start date (YYYY-MM-DD).
-            end_date: End date (YYYY-MM-DD).
-            category: Filter by category (image, video, chat, music).
+            image_base64: Base64-encoded input image.
+            type: Upscale type — "fast" (2x, instant) or "creative" (4x, slower).
 
         Returns:
-            UsageResponse with credit usage breakdown.
+            Dict with upscaled image data.
         """
-        params: dict[str, Any] = {}
-        if start_date is not None:
-            params["start_date"] = start_date
-        if end_date is not None:
-            params["end_date"] = end_date
-        if category is not None:
-            params["category"] = category
+        return self.stability_run("upscale", image_base64, type=type)
 
-        response = self._request("GET", "/v1/usage", params=params)
-        return UsageResponse(**response.json())
+    def stability_remove_background(
+        self,
+        image_base64: str,
+    ) -> dict[str, Any]:
+        """Remove background from an image using Stability AI.
 
-    # --- Storage Buckets ---
-
-    def list_buckets(self) -> BucketListResponse:
-        """List all storage buckets for your account.
+        Args:
+            image_base64: Base64-encoded input image.
 
         Returns:
-            BucketListResponse with list of buckets.
+            Dict with transparent-background image data.
         """
-        response = self._request("GET", "/v1/buckets")
-        return BucketListResponse(**response.json())
+        return self.stability_run("remove-background", image_base64)
 
-    def create_bucket(
+    def stability_erase(
+        self,
+        image_base64: str,
+        mask_base64: str,
+    ) -> dict[str, Any]:
+        """Erase regions from an image (content-aware fill).
+
+        Args:
+            image_base64: Base64-encoded input image.
+            mask_base64: Base64-encoded mask (white = erase).
+
+        Returns:
+            Dict with result image data.
+        """
+        return self.stability_run("erase", image_base64, mask=mask_base64)
+
+    def stability_inpaint(
+        self,
+        image_base64: str,
+        mask_base64: str,
+        prompt: str,
+    ) -> dict[str, Any]:
+        """Inpaint masked regions of an image with a prompt.
+
+        Args:
+            image_base64: Base64-encoded input image.
+            mask_base64: Base64-encoded mask (white = inpaint).
+            prompt: What to paint into the masked region.
+
+        Returns:
+            Dict with inpainted image data.
+        """
+        return self.stability_run("inpaint", image_base64, mask=mask_base64, prompt=prompt)
+
+    def stability_outpaint(
+        self,
+        image_base64: str,
+        *,
+        left: int = 0,
+        right: int = 0,
+        up: int = 0,
+        down: int = 0,
+    ) -> dict[str, Any]:
+        """Extend an image beyond its borders (outpainting).
+
+        Args:
+            image_base64: Base64-encoded input image.
+            left: Pixels to extend left.
+            right: Pixels to extend right.
+            up: Pixels to extend up.
+            down: Pixels to extend down.
+
+        Returns:
+            Dict with extended image data.
+        """
+        return self.stability_run(
+            "outpaint", image_base64, left=left, right=right, up=up, down=down
+        )
+
+    def stability_search_replace(
+        self,
+        image_base64: str,
+        search_prompt: str,
+        prompt: str,
+    ) -> dict[str, Any]:
+        """Search for an object in an image and replace it.
+
+        Args:
+            image_base64: Base64-encoded input image.
+            search_prompt: Description of what to find and replace.
+            prompt: Description of the replacement.
+
+        Returns:
+            Dict with result image data.
+        """
+        return self.stability_run(
+            "search-and-replace", image_base64, prompt=prompt, search_prompt=search_prompt
+        )
+
+    def stability_recolor(
+        self,
+        image_base64: str,
+        search_prompt: str,
+        prompt: str,
+    ) -> dict[str, Any]:
+        """Recolor a specific object in an image.
+
+        Args:
+            image_base64: Base64-encoded input image.
+            search_prompt: Description of the object to recolor.
+            prompt: Description of the new color/appearance.
+
+        Returns:
+            Dict with recolored image data.
+        """
+        return self.stability_run(
+            "recolor", image_base64, prompt=prompt, search_prompt=search_prompt
+        )
+
+    def stability_style_transfer(
+        self,
+        image_base64: str,
+        reference_base64: str,
+    ) -> dict[str, Any]:
+        """Transfer the style of a reference image onto a source image.
+
+        Args:
+            image_base64: Base64-encoded source image.
+            reference_base64: Base64-encoded style reference image.
+
+        Returns:
+            Dict with style-transferred image data.
+        """
+        return self.stability_run("style-transfer", image_base64, reference=reference_base64)
+
+    # =========================================================================
+    # Billing
+    # =========================================================================
+
+    def get_balance(self) -> dict[str, Any]:
+        """Get current credit balance and plan info.
+
+        Returns:
+            Dict with credits_remaining, plan, limits, usage_this_period.
+        """
+        response = self._request("GET", "/v1/billing/balance")
+        return response.json()
+
+    def get_pricing(self) -> dict[str, Any]:
+        """Get pricing for all AI operations.
+
+        Returns:
+            Dict with per-model credit costs by category.
+        """
+        response = self._request("GET", "/v1/billing/pricing")
+        return response.json()
+
+    def get_plans(self) -> dict[str, Any]:
+        """Get available subscription plans.
+
+        Returns:
+            Dict with list of plans, their features and pricing.
+        """
+        response = self._request("GET", "/v1/billing/plans")
+        return response.json()
+
+    def get_credits(self) -> dict[str, Any]:
+        """Get detailed credit breakdown (included, bonus, topup).
+
+        Returns:
+            Dict with credit pools and expiration info.
+        """
+        response = self._request("GET", "/v1/billing/credits")
+        return response.json()
+
+    def set_overage_limit(
+        self,
+        hard_limit_pln: float,
+        *,
+        project_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Set the hard spending limit for overage charges.
+
+        Args:
+            hard_limit_pln: Maximum overage amount in PLN.
+            project_id: Optional project ID (defaults to account-level).
+
+        Returns:
+            Dict confirming the updated limit.
+        """
+        payload: dict[str, Any] = {"hard_limit_pln": hard_limit_pln}
+        if project_id is not None:
+            payload["project_id"] = project_id
+
+        response = self._request("POST", "/v1/billing/overage-limit", json_data=payload)
+        return response.json()
+
+    def get_topup_packages(self) -> list[dict[str, Any]]:
+        """Get available credit top-up packages.
+
+        Returns:
+            List of packages with id, credits, price_pln, bonus.
+        """
+        response = self._request("GET", "/v1/billing/topup/packages")
+        data = response.json()
+        return data.get("packages", data) if isinstance(data, dict) else data
+
+    def create_topup(self, package: str) -> dict[str, Any]:
+        """Purchase a credit top-up package.
+
+        Args:
+            package: Package identifier (e.g. "starter", "pro", "enterprise").
+
+        Returns:
+            Dict with payment URL or confirmation.
+        """
+        payload: dict[str, Any] = {"package": package}
+
+        response = self._request("POST", "/v1/billing/topup", json_data=payload)
+        return response.json()
+
+    def get_transactions(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        type_filter: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Get credit transaction history.
+
+        Args:
+            page: Page number (starting at 1).
+            page_size: Items per page (max 100).
+            type_filter: Filter by type ("charge", "topup", "refund", "bonus").
+
+        Returns:
+            Dict with transactions list and pagination metadata.
+        """
+        params: dict[str, Any] = {"page": page, "page_size": page_size}
+        if type_filter is not None:
+            params["type"] = type_filter
+
+        response = self._request("GET", "/v1/billing/transactions", params=params)
+        return response.json()
+
+    def estimate_cost(self, operations: list[dict[str, Any]]) -> dict[str, Any]:
+        """Estimate the cost of a set of operations before running them.
+
+        Args:
+            operations: List of operation dicts, each with "type", "model",
+                and relevant parameters (width, height, duration, etc.).
+
+        Returns:
+            Dict with total_credits, breakdown per operation.
+        """
+        payload: dict[str, Any] = {"operations": operations}
+
+        response = self._request("POST", "/v1/billing/estimate", json_data=payload)
+        return response.json()
+
+    def get_invoices(self) -> dict[str, Any]:
+        """Get billing invoices.
+
+        Returns:
+            Dict with list of invoices and their status.
+        """
+        response = self._request("GET", "/v1/billing/invoices")
+        return response.json()
+
+    # =========================================================================
+    # Webhooks
+    # =========================================================================
+
+    def list_webhooks(self) -> list[dict[str, Any]]:
+        """List all webhook endpoints.
+
+        Returns:
+            List of webhook configurations.
+        """
+        response = self._request("GET", "/v1/webhooks")
+        data = response.json()
+        return data.get("webhooks", data) if isinstance(data, dict) else data
+
+    def create_webhook(
         self,
         name: str,
+        url: str,
+        events: list[str],
         *,
-        region: Optional[str] = None,
-        **kwargs: Any,
-    ) -> StorageBucket:
-        """Create a new storage bucket.
+        headers: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        """Create a new webhook endpoint.
 
         Args:
-            name: Bucket name.
-            region: AWS region (default: eu-central-1).
-            **kwargs: Additional parameters.
+            name: Human-readable name for the webhook.
+            url: The URL to receive webhook events.
+            events: List of event types (e.g. ["generation.completed",
+                "generation.failed", "credits.low"]).
+            headers: Custom headers to include in webhook requests.
 
         Returns:
-            StorageBucket with the created bucket details.
+            Dict with webhook ID, secret, and configuration.
         """
-        payload: dict[str, Any] = {"name": name}
-        if region is not None:
-            payload["region"] = region
-        payload.update(kwargs)
+        payload: dict[str, Any] = {
+            "name": name,
+            "url": url,
+            "events": events,
+        }
+        if headers is not None:
+            payload["headers"] = headers
 
-        response = self._request("POST", "/v1/buckets", json_data=payload)
-        return StorageBucket(**response.json())
+        response = self._request("POST", "/v1/webhooks", json_data=payload)
+        return response.json()
 
-    def provision_s3_bucket(
-        self,
-        *,
-        name: Optional[str] = None,
-        region: str = "eu-central-1",
-        **kwargs: Any,
-    ) -> BucketProvisionResponse:
-        """Provision a dedicated S3 bucket.
+    def update_webhook(self, webhook_id: str, **kwargs: Any) -> dict[str, Any]:
+        """Update an existing webhook endpoint.
 
         Args:
-            name: Desired bucket name (auto-generated if not provided).
-            region: AWS region (default: eu-central-1).
-            **kwargs: Additional parameters.
+            webhook_id: The webhook identifier.
+            **kwargs: Fields to update (url, events, name, headers, active).
 
         Returns:
-            BucketProvisionResponse with bucket details and credentials.
+            Dict with updated webhook configuration.
         """
-        payload: dict[str, Any] = {"region": region}
-        if name is not None:
-            payload["name"] = name
-        payload.update(kwargs)
-
-        response = self._request("POST", "/v1/storage/s3/buy", json_data=payload)
-        return BucketProvisionResponse(**response.json())
-
-    def presign_upload(
-        self,
-        bucket_id: str,
-        *,
-        key: str,
-        content_type: Optional[str] = None,
-        expires_in: int = 3600,
-        **kwargs: Any,
-    ) -> PresignedUrlResponse:
-        """Get a presigned URL for uploading an object.
-
-        Args:
-            bucket_id: The bucket ID.
-            key: Object key (path within the bucket).
-            content_type: MIME type of the file.
-            expires_in: URL expiry in seconds (default: 3600).
-            **kwargs: Additional parameters.
-
-        Returns:
-            PresignedUrlResponse with upload URL and headers.
-        """
-        payload: dict[str, Any] = {"key": key, "expires_in": expires_in}
-        if content_type is not None:
-            payload["content_type"] = content_type
-        payload.update(kwargs)
-
         response = self._request(
-            "POST",
-            f"/v1/storage/s3/buckets/{bucket_id}/objects/presign-upload",
-            json_data=payload,
+            "PATCH", f"/v1/webhooks/{webhook_id}", json_data=kwargs
         )
-        return PresignedUrlResponse(**response.json())
+        return response.json()
 
-    def presign_download(
-        self,
-        bucket_id: str,
-        *,
-        key: str,
-        expires_in: int = 3600,
-        **kwargs: Any,
-    ) -> PresignedUrlResponse:
-        """Get a presigned URL for downloading an object.
+    def delete_webhook(self, webhook_id: str) -> None:
+        """Delete a webhook endpoint.
 
         Args:
-            bucket_id: The bucket ID.
-            key: Object key (path within the bucket).
-            expires_in: URL expiry in seconds (default: 3600).
-            **kwargs: Additional parameters.
+            webhook_id: The webhook identifier.
+        """
+        self._request("DELETE", f"/v1/webhooks/{webhook_id}")
+
+    def test_webhook(self, webhook_id: str) -> dict[str, Any]:
+        """Send a test event to a webhook endpoint.
+
+        Args:
+            webhook_id: The webhook identifier.
 
         Returns:
-            PresignedUrlResponse with download URL.
+            Dict with delivery status and response code.
         """
-        payload: dict[str, Any] = {"key": key, "expires_in": expires_in}
-        payload.update(kwargs)
+        response = self._request("POST", f"/v1/webhooks/{webhook_id}/test")
+        return response.json()
 
-        response = self._request(
-            "POST",
-            f"/v1/storage/s3/buckets/{bucket_id}/objects/presign-download",
-            json_data=payload,
+    def get_webhook_logs(self, webhook_id: str) -> list[dict[str, Any]]:
+        """Get delivery logs for a webhook.
+
+        Args:
+            webhook_id: The webhook identifier.
+
+        Returns:
+            List of delivery log entries with status, timestamp, response.
+        """
+        response = self._request("GET", f"/v1/webhooks/{webhook_id}/logs")
+        data = response.json()
+        return data.get("logs", data) if isinstance(data, dict) else data
+
+    # =========================================================================
+    # Convenience Helpers
+    # =========================================================================
+
+    def remove_background(self, image_url: str) -> dict[str, Any]:
+        """Remove the background from an image (convenience wrapper).
+
+        Args:
+            image_url: URL of the source image.
+
+        Returns:
+            Dict with processed image URL and metadata.
+        """
+        return self.edit_image(image_url, "remove background", mode="remove_bg")
+
+    def upscale_image(self, image_url: str, *, scale: int = 2) -> dict[str, Any]:
+        """Upscale an image to higher resolution (convenience wrapper).
+
+        Args:
+            image_url: URL of the image to upscale.
+            scale: Upscale factor (2 or 4, default: 2).
+
+        Returns:
+            Dict with upscaled image URL and metadata.
+        """
+        return self.edit_image(
+            image_url, f"upscale {scale}x", mode="upscale", scale=scale
         )
-        result = PresignedUrlResponse(**response.json())
-        result.method = "GET"
-        return result
 
-    # --- Lifecycle ---
+    def wait_for_video(
+        self,
+        job_id: str,
+        *,
+        poll_interval: float = 5.0,
+        timeout: float = 300.0,
+    ) -> dict[str, Any]:
+        """Poll a video generation job until completion or timeout.
+
+        Args:
+            job_id: The job ID from generate_video().
+            poll_interval: Seconds between status checks (default: 5).
+            timeout: Maximum seconds to wait (default: 300).
+
+        Returns:
+            Dict with final job status and video_url if completed.
+
+        Raises:
+            VideoJobTimeoutError: If timeout is exceeded.
+        """
+        start_time = time.time()
+
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                raise VideoJobTimeoutError(
+                    message=f"Video job {job_id} did not complete within {timeout}s",
+                    job_id=job_id,
+                )
+
+            response = self._request("GET", f"/v1/ai/generate/video/{job_id}")
+            job = response.json()
+
+            status = job.get("status", "")
+            if status in ("completed", "failed"):
+                return job
+
+            time.sleep(poll_interval)
+
+    # =========================================================================
+    # Lifecycle
+    # =========================================================================
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -637,15 +1075,21 @@ class FotoHub(_BaseClient):
         self.close()
 
 
+# ---------------------------------------------------------------------------
+# Asynchronous Client
+# ---------------------------------------------------------------------------
+
+
 class AsyncFotoHub(_BaseClient):
     """Asynchronous FOTOhub API client.
 
-    Usage:
+    Usage::
+
         from fotohub import AsyncFotoHub
 
         async with AsyncFotoHub(api_key="your-api-key") as client:
             result = await client.generate_image(prompt="A sunset over mountains")
-            print(result.images[0].url)
+            print(result["images"][0]["url"])
     """
 
     def __init__(
@@ -712,7 +1156,9 @@ class AsyncFotoHub(_BaseClient):
             raise TimeoutError(message=f"Request failed after {self.max_retries} retries")
         raise FotoHubError("Unexpected retry exhaustion")
 
-    # --- Image Generation ---
+    # =========================================================================
+    # AI Generation
+    # =========================================================================
 
     async def generate_image(
         self,
@@ -721,108 +1167,851 @@ class AsyncFotoHub(_BaseClient):
         model: str = DEFAULT_IMAGE_MODEL,
         width: int = 1024,
         height: int = 1024,
+        aspect_ratio: str = "1:1",
         num_images: int = 1,
         negative_prompt: Optional[str] = None,
+        style: Optional[str] = None,
         seed: Optional[int] = None,
-        guidance_scale: Optional[float] = None,
-        steps: Optional[int] = None,
-        **kwargs: Any,
-    ) -> ImageGenerationResponse:
+    ) -> dict[str, Any]:
         """Generate images from a text prompt.
 
         Args:
             prompt: Text description of the desired image.
-            model: Model to use. Default: seedream-5-0-260128 (SeedDream 5.0 Lite).
-            width: Image width in pixels (default: 1024).
-            height: Image height in pixels (default: 1024).
-            num_images: Number of images to generate (default: 1).
+            model: Model to use (default: seedream-5-0-260128).
+            width: Image width in pixels.
+            height: Image height in pixels.
+            aspect_ratio: Aspect ratio string (e.g. "1:1", "16:9", "9:16").
+            num_images: Number of images to generate (1-4).
             negative_prompt: Things to avoid in the image.
+            style: Style preset (e.g. "photographic", "cinematic", "anime").
             seed: Random seed for reproducibility.
-            guidance_scale: How closely to follow the prompt (model-dependent).
-            steps: Number of diffusion steps (model-dependent).
-            **kwargs: Additional model-specific parameters.
 
         Returns:
-            ImageGenerationResponse with generated image URLs and metadata.
+            Dict with ``images`` list containing URLs, model, credits_used.
         """
         payload: dict[str, Any] = {
             "prompt": prompt,
             "model": model,
             "width": width,
             "height": height,
+            "aspect_ratio": aspect_ratio,
             "num_images": num_images,
         }
         if negative_prompt is not None:
             payload["negative_prompt"] = negative_prompt
+        if style is not None:
+            payload["style"] = style
         if seed is not None:
             payload["seed"] = seed
-        if guidance_scale is not None:
-            payload["guidance_scale"] = guidance_scale
-        if steps is not None:
-            payload["steps"] = steps
-        payload.update(kwargs)
 
         response = await self._request("POST", "/v1/ai/generate/image", json_data=payload)
-        return ImageGenerationResponse(**response.json())
+        return response.json()
 
-    # --- Video Generation ---
+    async def edit_image(
+        self,
+        image_url: str,
+        prompt: str,
+        *,
+        mode: str = "inpaint",
+        mask_url: Optional[str] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Edit an existing image using AI.
+
+        Args:
+            image_url: URL of the source image.
+            prompt: Instruction for the edit.
+            mode: Edit mode — "inpaint", "outpaint", "remove_bg", "upscale",
+                "style_transfer".
+            mask_url: URL of the mask image (required for inpaint/erase).
+            model: Model override.
+            **kwargs: Additional parameters.
+
+        Returns:
+            Dict with edited image URL and metadata.
+        """
+        payload: dict[str, Any] = {
+            "image_url": image_url,
+            "prompt": prompt,
+            "mode": mode,
+        }
+        if mask_url is not None:
+            payload["mask_url"] = mask_url
+        if model is not None:
+            payload["model"] = model
+        payload.update(kwargs)
+
+        response = await self._request("POST", "/v1/ai/edit/image", json_data=payload)
+        return response.json()
 
     async def generate_video(
         self,
         prompt: str,
         *,
-        model: Optional[str] = None,
-        duration: Optional[float] = None,
+        model: str = DEFAULT_VIDEO_MODEL,
+        duration: int = 5,
+        aspect_ratio: str = "16:9",
         image_url: Optional[str] = None,
-        aspect_ratio: Optional[str] = None,
-        **kwargs: Any,
-    ) -> VideoJob:
+        resolution: str = "1080p",
+    ) -> dict[str, Any]:
         """Start an asynchronous video generation job.
 
         Args:
             prompt: Text description of the desired video.
-            model: Video model to use.
-            duration: Desired video duration in seconds.
-            image_url: Reference image URL for image-to-video.
-            aspect_ratio: Aspect ratio (e.g., "16:9", "9:16", "1:1").
-            **kwargs: Additional model-specific parameters.
+            model: Video model (default: veo-2).
+            duration: Desired duration in seconds.
+            aspect_ratio: Aspect ratio (e.g. "16:9", "9:16", "1:1").
+            image_url: Reference image for image-to-video generation.
+            resolution: Output resolution ("720p", "1080p", "4k").
 
         Returns:
-            VideoJob with job_id and initial status.
+            Dict with job_id and initial status.
         """
-        payload: dict[str, Any] = {"prompt": prompt}
-        if model is not None:
-            payload["model"] = model
-        if duration is not None:
-            payload["duration"] = duration
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "model": model,
+            "duration": duration,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+        }
         if image_url is not None:
             payload["image_url"] = image_url
-        if aspect_ratio is not None:
-            payload["aspect_ratio"] = aspect_ratio
-        payload.update(kwargs)
 
         response = await self._request("POST", "/v1/ai/generate/video", json_data=payload)
-        return VideoJob(**response.json())
+        return response.json()
 
-    async def poll_video(
+    async def generate_music(
+        self,
+        prompt: str,
+        *,
+        model: str = DEFAULT_MUSIC_MODEL,
+        duration: int = 30,
+        genre: Optional[str] = None,
+        mood: Optional[str] = None,
+        tempo: int = 120,
+        instrumental: bool = True,
+    ) -> dict[str, Any]:
+        """Generate music from a text description.
+
+        Args:
+            prompt: Description of the desired music.
+            model: Music generation model (default: minimax).
+            duration: Duration in seconds (5-300).
+            genre: Genre hint (e.g. "electronic", "classical", "jazz").
+            mood: Mood hint (e.g. "happy", "melancholic", "energetic").
+            tempo: BPM (40-240, default: 120).
+            instrumental: Whether to generate instrumental-only (default: True).
+
+        Returns:
+            Dict with audio URL, duration, credits_used.
+        """
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "model": model,
+            "duration": duration,
+            "tempo": tempo,
+            "instrumental": instrumental,
+        }
+        if genre is not None:
+            payload["genre"] = genre
+        if mood is not None:
+            payload["mood"] = mood
+
+        response = await self._request("POST", "/v1/ai/generate/music", json_data=payload)
+        return response.json()
+
+    async def generate_sfx(
+        self,
+        prompt: str,
+        *,
+        duration: int = 5,
+    ) -> dict[str, Any]:
+        """Generate a short sound effect.
+
+        Args:
+            prompt: Description of the sound effect.
+            duration: Duration in seconds (1-30, default: 5).
+
+        Returns:
+            Dict with audio URL and metadata.
+        """
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "duration": duration,
+        }
+
+        response = await self._request("POST", "/v1/ai/generate/sfx", json_data=payload)
+        return response.json()
+
+    async def generate_speech(
+        self,
+        text: str,
+        *,
+        voice_id: Optional[str] = None,
+        model: str = DEFAULT_SPEECH_MODEL,
+        language: str = "pl",
+        speed: float = 1.0,
+        pitch: int = 0,
+    ) -> dict[str, Any]:
+        """Generate speech audio from text (TTS).
+
+        Args:
+            text: Text to convert to speech.
+            voice_id: Voice identifier (provider-specific).
+            model: TTS model/provider (default: "google").
+            language: Language code (default: "pl").
+            speed: Speech speed multiplier (0.5-2.0, default: 1.0).
+            pitch: Pitch adjustment in semitones (-10 to 10, default: 0).
+
+        Returns:
+            Dict with audio URL, duration, credits_used.
+        """
+        payload: dict[str, Any] = {
+            "text": text,
+            "model": model,
+            "language": language,
+            "speed": speed,
+            "pitch": pitch,
+        }
+        if voice_id is not None:
+            payload["voice_id"] = voice_id
+
+        response = await self._request("POST", "/v1/ai/generate/speech", json_data=payload)
+        return response.json()
+
+    async def transcribe(
+        self,
+        audio_url: str,
+        *,
+        language: str = "auto",
+    ) -> dict[str, Any]:
+        """Transcribe audio to text.
+
+        Args:
+            audio_url: URL of the audio file.
+            language: Language code or "auto" for auto-detection.
+
+        Returns:
+            Dict with transcribed text, detected language, segments.
+        """
+        payload: dict[str, Any] = {
+            "audio_url": audio_url,
+            "language": language,
+        }
+
+        response = await self._request("POST", "/v1/ai/transcribe", json_data=payload)
+        return response.json()
+
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        model: str = DEFAULT_CHAT_MODEL,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        stream: bool = False,
+    ) -> Union[dict[str, Any], AsyncChatStream]:
+        """Send a chat completion request (OpenAI-compatible).
+
+        Args:
+            messages: List of message dicts with ``role`` and ``content``.
+            model: LLM model (default: gemini-flash).
+            temperature: Sampling temperature (0-2, default: 0.7).
+            max_tokens: Maximum tokens in the response.
+            stream: If True, returns an AsyncChatStream iterator yielding SSE chunks.
+
+        Returns:
+            Dict with choices, usage if stream=False; AsyncChatStream if stream=True.
+        """
+        payload: dict[str, Any] = {
+            "messages": messages,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": stream,
+        }
+
+        if stream:
+            response = await self._request(
+                "POST", "/v1/ai/chat", json_data=payload, stream=True
+            )
+            return AsyncChatStream(response)
+
+        response = await self._request("POST", "/v1/ai/chat", json_data=payload)
+        return response.json()
+
+    async def chat_bedrock(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        model: str = DEFAULT_BEDROCK_MODEL,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        system: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Send a chat request via AWS Bedrock (Claude/Anthropic models).
+
+        Args:
+            messages: List of message dicts with ``role`` and ``content``.
+            model: Bedrock model ID (default: claude-sonnet-4.6).
+            temperature: Sampling temperature (0-1).
+            max_tokens: Maximum tokens in the response.
+            system: System prompt (prepended to conversation).
+
+        Returns:
+            Dict with response content, usage, stop_reason.
+        """
+        payload: dict[str, Any] = {
+            "messages": messages,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if system is not None:
+            payload["system"] = system
+
+        response = await self._request("POST", "/v1/ai/chat/bedrock", json_data=payload)
+        return response.json()
+
+    async def analyze_image(
+        self,
+        image_url: str,
+        *,
+        features: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """Analyze an image using vision models.
+
+        Args:
+            image_url: URL of the image to analyze.
+            features: List of analysis features (e.g. ["caption", "objects",
+                "text", "faces", "nsfw", "colors"]).
+
+        Returns:
+            Dict with analysis results keyed by feature.
+        """
+        payload: dict[str, Any] = {"image_url": image_url}
+        if features is not None:
+            payload["features"] = features
+
+        response = await self._request("POST", "/v1/ai/analyze/image", json_data=payload)
+        return response.json()
+
+    async def enhance_prompt(
+        self,
+        prompt: str,
+        *,
+        style: str = "photographic",
+    ) -> str:
+        """Enhance a short prompt into a detailed generation prompt.
+
+        Args:
+            prompt: Short input prompt.
+            style: Target style ("photographic", "cinematic", "illustration",
+                "3d", "anime").
+
+        Returns:
+            Enhanced prompt string.
+        """
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "style": style,
+        }
+
+        response = await self._request("POST", "/v1/ai/enhance-prompt", json_data=payload)
+        data = response.json()
+        return data.get("enhanced_prompt", data.get("prompt", prompt))
+
+    # =========================================================================
+    # Stability AI Tools
+    # =========================================================================
+
+    async def stability_tools(self) -> list[dict[str, Any]]:
+        """List available Stability AI tools and their capabilities.
+
+        Returns:
+            List of tool descriptors with id, name, description, parameters.
+        """
+        response = await self._request("GET", "/v1/ai/stability/tools")
+        data = response.json()
+        return data.get("tools", data) if isinstance(data, dict) else data
+
+    async def stability_run(
+        self,
+        tool_id: str,
+        image_base64: str,
+        *,
+        mask: Optional[str] = None,
+        prompt: Optional[str] = None,
+        reference: Optional[str] = None,
+        seed: Optional[int] = None,
+        negative_prompt: Optional[str] = None,
+        output_format: str = "png",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Run a Stability AI tool on an image.
+
+        Args:
+            tool_id: The tool identifier (e.g. "remove-background", "upscale").
+            image_base64: Base64-encoded input image.
+            mask: Base64-encoded mask image (for inpaint/erase).
+            prompt: Text prompt (for generation-based tools).
+            reference: Base64-encoded reference image (for style transfer).
+            seed: Random seed for reproducibility.
+            negative_prompt: Things to avoid.
+            output_format: Output format ("png", "webp", "jpeg").
+            **kwargs: Additional tool-specific parameters.
+
+        Returns:
+            Dict with output image (base64 or URL), seed, credits_used.
+        """
+        payload: dict[str, Any] = {
+            "tool_id": tool_id,
+            "image": image_base64,
+            "output_format": output_format,
+        }
+        if mask is not None:
+            payload["mask"] = mask
+        if prompt is not None:
+            payload["prompt"] = prompt
+        if reference is not None:
+            payload["reference"] = reference
+        if seed is not None:
+            payload["seed"] = seed
+        if negative_prompt is not None:
+            payload["negative_prompt"] = negative_prompt
+        payload.update(kwargs)
+
+        response = await self._request("POST", "/v1/ai/stability/run", json_data=payload)
+        return response.json()
+
+    async def stability_upscale(
+        self,
+        image_base64: str,
+        *,
+        type: str = "fast",
+    ) -> dict[str, Any]:
+        """Upscale an image using Stability AI.
+
+        Args:
+            image_base64: Base64-encoded input image.
+            type: Upscale type — "fast" (2x, instant) or "creative" (4x, slower).
+
+        Returns:
+            Dict with upscaled image data.
+        """
+        return await self.stability_run("upscale", image_base64, type=type)
+
+    async def stability_remove_background(
+        self,
+        image_base64: str,
+    ) -> dict[str, Any]:
+        """Remove background from an image using Stability AI.
+
+        Args:
+            image_base64: Base64-encoded input image.
+
+        Returns:
+            Dict with transparent-background image data.
+        """
+        return await self.stability_run("remove-background", image_base64)
+
+    async def stability_erase(
+        self,
+        image_base64: str,
+        mask_base64: str,
+    ) -> dict[str, Any]:
+        """Erase regions from an image (content-aware fill).
+
+        Args:
+            image_base64: Base64-encoded input image.
+            mask_base64: Base64-encoded mask (white = erase).
+
+        Returns:
+            Dict with result image data.
+        """
+        return await self.stability_run("erase", image_base64, mask=mask_base64)
+
+    async def stability_inpaint(
+        self,
+        image_base64: str,
+        mask_base64: str,
+        prompt: str,
+    ) -> dict[str, Any]:
+        """Inpaint masked regions of an image with a prompt.
+
+        Args:
+            image_base64: Base64-encoded input image.
+            mask_base64: Base64-encoded mask (white = inpaint).
+            prompt: What to paint into the masked region.
+
+        Returns:
+            Dict with inpainted image data.
+        """
+        return await self.stability_run(
+            "inpaint", image_base64, mask=mask_base64, prompt=prompt
+        )
+
+    async def stability_outpaint(
+        self,
+        image_base64: str,
+        *,
+        left: int = 0,
+        right: int = 0,
+        up: int = 0,
+        down: int = 0,
+    ) -> dict[str, Any]:
+        """Extend an image beyond its borders (outpainting).
+
+        Args:
+            image_base64: Base64-encoded input image.
+            left: Pixels to extend left.
+            right: Pixels to extend right.
+            up: Pixels to extend up.
+            down: Pixels to extend down.
+
+        Returns:
+            Dict with extended image data.
+        """
+        return await self.stability_run(
+            "outpaint", image_base64, left=left, right=right, up=up, down=down
+        )
+
+    async def stability_search_replace(
+        self,
+        image_base64: str,
+        search_prompt: str,
+        prompt: str,
+    ) -> dict[str, Any]:
+        """Search for an object in an image and replace it.
+
+        Args:
+            image_base64: Base64-encoded input image.
+            search_prompt: Description of what to find and replace.
+            prompt: Description of the replacement.
+
+        Returns:
+            Dict with result image data.
+        """
+        return await self.stability_run(
+            "search-and-replace", image_base64, prompt=prompt, search_prompt=search_prompt
+        )
+
+    async def stability_recolor(
+        self,
+        image_base64: str,
+        search_prompt: str,
+        prompt: str,
+    ) -> dict[str, Any]:
+        """Recolor a specific object in an image.
+
+        Args:
+            image_base64: Base64-encoded input image.
+            search_prompt: Description of the object to recolor.
+            prompt: Description of the new color/appearance.
+
+        Returns:
+            Dict with recolored image data.
+        """
+        return await self.stability_run(
+            "recolor", image_base64, prompt=prompt, search_prompt=search_prompt
+        )
+
+    async def stability_style_transfer(
+        self,
+        image_base64: str,
+        reference_base64: str,
+    ) -> dict[str, Any]:
+        """Transfer the style of a reference image onto a source image.
+
+        Args:
+            image_base64: Base64-encoded source image.
+            reference_base64: Base64-encoded style reference image.
+
+        Returns:
+            Dict with style-transferred image data.
+        """
+        return await self.stability_run(
+            "style-transfer", image_base64, reference=reference_base64
+        )
+
+    # =========================================================================
+    # Billing
+    # =========================================================================
+
+    async def get_balance(self) -> dict[str, Any]:
+        """Get current credit balance and plan info.
+
+        Returns:
+            Dict with credits_remaining, plan, limits, usage_this_period.
+        """
+        response = await self._request("GET", "/v1/billing/balance")
+        return response.json()
+
+    async def get_pricing(self) -> dict[str, Any]:
+        """Get pricing for all AI operations.
+
+        Returns:
+            Dict with per-model credit costs by category.
+        """
+        response = await self._request("GET", "/v1/billing/pricing")
+        return response.json()
+
+    async def get_plans(self) -> dict[str, Any]:
+        """Get available subscription plans.
+
+        Returns:
+            Dict with list of plans, their features and pricing.
+        """
+        response = await self._request("GET", "/v1/billing/plans")
+        return response.json()
+
+    async def get_credits(self) -> dict[str, Any]:
+        """Get detailed credit breakdown (included, bonus, topup).
+
+        Returns:
+            Dict with credit pools and expiration info.
+        """
+        response = await self._request("GET", "/v1/billing/credits")
+        return response.json()
+
+    async def set_overage_limit(
+        self,
+        hard_limit_pln: float,
+        *,
+        project_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Set the hard spending limit for overage charges.
+
+        Args:
+            hard_limit_pln: Maximum overage amount in PLN.
+            project_id: Optional project ID (defaults to account-level).
+
+        Returns:
+            Dict confirming the updated limit.
+        """
+        payload: dict[str, Any] = {"hard_limit_pln": hard_limit_pln}
+        if project_id is not None:
+            payload["project_id"] = project_id
+
+        response = await self._request(
+            "POST", "/v1/billing/overage-limit", json_data=payload
+        )
+        return response.json()
+
+    async def get_topup_packages(self) -> list[dict[str, Any]]:
+        """Get available credit top-up packages.
+
+        Returns:
+            List of packages with id, credits, price_pln, bonus.
+        """
+        response = await self._request("GET", "/v1/billing/topup/packages")
+        data = response.json()
+        return data.get("packages", data) if isinstance(data, dict) else data
+
+    async def create_topup(self, package: str) -> dict[str, Any]:
+        """Purchase a credit top-up package.
+
+        Args:
+            package: Package identifier (e.g. "starter", "pro", "enterprise").
+
+        Returns:
+            Dict with payment URL or confirmation.
+        """
+        payload: dict[str, Any] = {"package": package}
+
+        response = await self._request("POST", "/v1/billing/topup", json_data=payload)
+        return response.json()
+
+    async def get_transactions(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        type_filter: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Get credit transaction history.
+
+        Args:
+            page: Page number (starting at 1).
+            page_size: Items per page (max 100).
+            type_filter: Filter by type ("charge", "topup", "refund", "bonus").
+
+        Returns:
+            Dict with transactions list and pagination metadata.
+        """
+        params: dict[str, Any] = {"page": page, "page_size": page_size}
+        if type_filter is not None:
+            params["type"] = type_filter
+
+        response = await self._request("GET", "/v1/billing/transactions", params=params)
+        return response.json()
+
+    async def estimate_cost(self, operations: list[dict[str, Any]]) -> dict[str, Any]:
+        """Estimate the cost of a set of operations before running them.
+
+        Args:
+            operations: List of operation dicts, each with "type", "model",
+                and relevant parameters (width, height, duration, etc.).
+
+        Returns:
+            Dict with total_credits, breakdown per operation.
+        """
+        payload: dict[str, Any] = {"operations": operations}
+
+        response = await self._request("POST", "/v1/billing/estimate", json_data=payload)
+        return response.json()
+
+    async def get_invoices(self) -> dict[str, Any]:
+        """Get billing invoices.
+
+        Returns:
+            Dict with list of invoices and their status.
+        """
+        response = await self._request("GET", "/v1/billing/invoices")
+        return response.json()
+
+    # =========================================================================
+    # Webhooks
+    # =========================================================================
+
+    async def list_webhooks(self) -> list[dict[str, Any]]:
+        """List all webhook endpoints.
+
+        Returns:
+            List of webhook configurations.
+        """
+        response = await self._request("GET", "/v1/webhooks")
+        data = response.json()
+        return data.get("webhooks", data) if isinstance(data, dict) else data
+
+    async def create_webhook(
+        self,
+        name: str,
+        url: str,
+        events: list[str],
+        *,
+        headers: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        """Create a new webhook endpoint.
+
+        Args:
+            name: Human-readable name for the webhook.
+            url: The URL to receive webhook events.
+            events: List of event types (e.g. ["generation.completed",
+                "generation.failed", "credits.low"]).
+            headers: Custom headers to include in webhook requests.
+
+        Returns:
+            Dict with webhook ID, secret, and configuration.
+        """
+        payload: dict[str, Any] = {
+            "name": name,
+            "url": url,
+            "events": events,
+        }
+        if headers is not None:
+            payload["headers"] = headers
+
+        response = await self._request("POST", "/v1/webhooks", json_data=payload)
+        return response.json()
+
+    async def update_webhook(self, webhook_id: str, **kwargs: Any) -> dict[str, Any]:
+        """Update an existing webhook endpoint.
+
+        Args:
+            webhook_id: The webhook identifier.
+            **kwargs: Fields to update (url, events, name, headers, active).
+
+        Returns:
+            Dict with updated webhook configuration.
+        """
+        response = await self._request(
+            "PATCH", f"/v1/webhooks/{webhook_id}", json_data=kwargs
+        )
+        return response.json()
+
+    async def delete_webhook(self, webhook_id: str) -> None:
+        """Delete a webhook endpoint.
+
+        Args:
+            webhook_id: The webhook identifier.
+        """
+        await self._request("DELETE", f"/v1/webhooks/{webhook_id}")
+
+    async def test_webhook(self, webhook_id: str) -> dict[str, Any]:
+        """Send a test event to a webhook endpoint.
+
+        Args:
+            webhook_id: The webhook identifier.
+
+        Returns:
+            Dict with delivery status and response code.
+        """
+        response = await self._request("POST", f"/v1/webhooks/{webhook_id}/test")
+        return response.json()
+
+    async def get_webhook_logs(self, webhook_id: str) -> list[dict[str, Any]]:
+        """Get delivery logs for a webhook.
+
+        Args:
+            webhook_id: The webhook identifier.
+
+        Returns:
+            List of delivery log entries with status, timestamp, response.
+        """
+        response = await self._request("GET", f"/v1/webhooks/{webhook_id}/logs")
+        data = response.json()
+        return data.get("logs", data) if isinstance(data, dict) else data
+
+    # =========================================================================
+    # Convenience Helpers
+    # =========================================================================
+
+    async def remove_background(self, image_url: str) -> dict[str, Any]:
+        """Remove the background from an image (convenience wrapper).
+
+        Args:
+            image_url: URL of the source image.
+
+        Returns:
+            Dict with processed image URL and metadata.
+        """
+        return await self.edit_image(image_url, "remove background", mode="remove_bg")
+
+    async def upscale_image(self, image_url: str, *, scale: int = 2) -> dict[str, Any]:
+        """Upscale an image to higher resolution (convenience wrapper).
+
+        Args:
+            image_url: URL of the image to upscale.
+            scale: Upscale factor (2 or 4, default: 2).
+
+        Returns:
+            Dict with upscaled image URL and metadata.
+        """
+        return await self.edit_image(
+            image_url, f"upscale {scale}x", mode="upscale", scale=scale
+        )
+
+    async def wait_for_video(
         self,
         job_id: str,
         *,
         poll_interval: float = 5.0,
-        max_wait: float = 600.0,
-    ) -> VideoJob:
+        timeout: float = 300.0,
+    ) -> dict[str, Any]:
         """Poll a video generation job until completion or timeout.
 
         Args:
-            job_id: The job ID returned by generate_video().
+            job_id: The job ID from generate_video().
             poll_interval: Seconds between status checks (default: 5).
-            max_wait: Maximum seconds to wait (default: 600).
+            timeout: Maximum seconds to wait (default: 300).
 
         Returns:
-            VideoJob with final status and video_url (if completed).
+            Dict with final job status and video_url if completed.
 
         Raises:
-            VideoJobTimeoutError: If max_wait is exceeded.
+            VideoJobTimeoutError: If timeout is exceeded.
         """
         import asyncio
 
@@ -830,314 +2019,24 @@ class AsyncFotoHub(_BaseClient):
 
         while True:
             elapsed = time.time() - start_time
-            if elapsed >= max_wait:
+            if elapsed >= timeout:
                 raise VideoJobTimeoutError(
-                    message=f"Video job {job_id} did not complete within {max_wait}s",
+                    message=f"Video job {job_id} did not complete within {timeout}s",
                     job_id=job_id,
                 )
 
             response = await self._request("GET", f"/v1/ai/generate/video/{job_id}")
-            job = VideoJob(**response.json())
+            job = response.json()
 
-            if job.status in ("completed", "failed"):
+            status = job.get("status", "")
+            if status in ("completed", "failed"):
                 return job
 
             await asyncio.sleep(poll_interval)
 
-    # --- Music Generation ---
-
-    async def generate_music(
-        self,
-        prompt: str,
-        *,
-        model: Optional[str] = None,
-        duration: Optional[float] = None,
-        **kwargs: Any,
-    ) -> MusicGenerationResponse:
-        """Generate music from a text description.
-
-        Args:
-            prompt: Text description of the desired music.
-            model: Music generation model to use.
-            duration: Desired duration in seconds.
-            **kwargs: Additional model-specific parameters.
-
-        Returns:
-            MusicGenerationResponse with audio URL and metadata.
-        """
-        payload: dict[str, Any] = {"prompt": prompt}
-        if model is not None:
-            payload["model"] = model
-        if duration is not None:
-            payload["duration"] = duration
-        payload.update(kwargs)
-
-        response = await self._request("POST", "/v1/ai/generate/music", json_data=payload)
-        return MusicGenerationResponse(**response.json())
-
-    # --- Chat / LLM ---
-
-    async def chat(
-        self,
-        messages: list[Union[dict[str, str], ChatMessage]],
-        *,
-        model: Optional[str] = None,
-        stream: bool = False,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        top_p: Optional[float] = None,
-        **kwargs: Any,
-    ) -> Union[ChatCompletion, AsyncChatStream]:
-        """Send a chat completion request (OpenAI-compatible).
-
-        Args:
-            messages: List of chat messages.
-            model: LLM model to use.
-            stream: If True, returns an AsyncChatStream iterator.
-            temperature: Sampling temperature (0-2).
-            max_tokens: Maximum tokens in the response.
-            top_p: Nucleus sampling parameter.
-            **kwargs: Additional parameters.
-
-        Returns:
-            ChatCompletion if stream=False, AsyncChatStream if stream=True.
-        """
-        formatted_messages = []
-        for msg in messages:
-            if isinstance(msg, ChatMessage):
-                formatted_messages.append({"role": msg.role.value, "content": msg.content})
-            else:
-                formatted_messages.append(msg)
-
-        payload: dict[str, Any] = {"messages": formatted_messages, "stream": stream}
-        if model is not None:
-            payload["model"] = model
-        if temperature is not None:
-            payload["temperature"] = temperature
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if top_p is not None:
-            payload["top_p"] = top_p
-        payload.update(kwargs)
-
-        if stream:
-            response = await self._request("POST", "/v1/ai/chat", json_data=payload, stream=True)
-            return AsyncChatStream(response)
-
-        response = await self._request("POST", "/v1/ai/chat", json_data=payload)
-        return ChatCompletion(**response.json())
-
-    # --- Translation ---
-
-    async def translate(
-        self,
-        text: str,
-        *,
-        target_language: str,
-        source_language: Optional[str] = None,
-        **kwargs: Any,
-    ) -> TranslationResult:
-        """Translate text between languages (no auth required).
-
-        Args:
-            text: Text to translate.
-            target_language: Target language code (e.g., "en", "pl", "de").
-            source_language: Source language code (auto-detected if not provided).
-            **kwargs: Additional parameters.
-
-        Returns:
-            TranslationResult with translated text.
-        """
-        payload: dict[str, Any] = {
-            "text": text,
-            "target_language": target_language,
-        }
-        if source_language is not None:
-            payload["source_language"] = source_language
-        payload.update(kwargs)
-
-        response = await self._request("POST", "/v1/ai/translate", json_data=payload)
-        return TranslationResult(**response.json())
-
-    # --- Gabriel (Intent Orchestration) ---
-
-    async def gabriel(
-        self,
-        message: str,
-        *,
-        context: Optional[dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> GabrielResponse:
-        """Send a message to the Gabriel intent orchestration engine (no auth required).
-
-        Args:
-            message: User message to process.
-            context: Optional context dictionary.
-            **kwargs: Additional parameters.
-
-        Returns:
-            GabrielResponse with detected intent and response.
-        """
-        payload: dict[str, Any] = {"message": message}
-        if context is not None:
-            payload["context"] = context
-        payload.update(kwargs)
-
-        response = await self._request("POST", "/v1/ai/gabriel", json_data=payload)
-        return GabrielResponse(**response.json())
-
-    # --- Usage Analytics ---
-
-    async def get_usage(
-        self,
-        *,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-        category: Optional[str] = None,
-    ) -> UsageResponse:
-        """Get usage analytics for your account.
-
-        Args:
-            start_date: Start date (YYYY-MM-DD).
-            end_date: End date (YYYY-MM-DD).
-            category: Filter by category (image, video, chat, music).
-
-        Returns:
-            UsageResponse with credit usage breakdown.
-        """
-        params: dict[str, Any] = {}
-        if start_date is not None:
-            params["start_date"] = start_date
-        if end_date is not None:
-            params["end_date"] = end_date
-        if category is not None:
-            params["category"] = category
-
-        response = await self._request("GET", "/v1/usage", params=params)
-        return UsageResponse(**response.json())
-
-    # --- Storage Buckets ---
-
-    async def list_buckets(self) -> BucketListResponse:
-        """List all storage buckets for your account."""
-        response = await self._request("GET", "/v1/buckets")
-        return BucketListResponse(**response.json())
-
-    async def create_bucket(
-        self,
-        name: str,
-        *,
-        region: Optional[str] = None,
-        **kwargs: Any,
-    ) -> StorageBucket:
-        """Create a new storage bucket.
-
-        Args:
-            name: Bucket name.
-            region: AWS region (default: eu-central-1).
-            **kwargs: Additional parameters.
-
-        Returns:
-            StorageBucket with the created bucket details.
-        """
-        payload: dict[str, Any] = {"name": name}
-        if region is not None:
-            payload["region"] = region
-        payload.update(kwargs)
-
-        response = await self._request("POST", "/v1/buckets", json_data=payload)
-        return StorageBucket(**response.json())
-
-    async def provision_s3_bucket(
-        self,
-        *,
-        name: Optional[str] = None,
-        region: str = "eu-central-1",
-        **kwargs: Any,
-    ) -> BucketProvisionResponse:
-        """Provision a dedicated S3 bucket.
-
-        Args:
-            name: Desired bucket name (auto-generated if not provided).
-            region: AWS region (default: eu-central-1).
-            **kwargs: Additional parameters.
-
-        Returns:
-            BucketProvisionResponse with bucket details and credentials.
-        """
-        payload: dict[str, Any] = {"region": region}
-        if name is not None:
-            payload["name"] = name
-        payload.update(kwargs)
-
-        response = await self._request("POST", "/v1/storage/s3/buy", json_data=payload)
-        return BucketProvisionResponse(**response.json())
-
-    async def presign_upload(
-        self,
-        bucket_id: str,
-        *,
-        key: str,
-        content_type: Optional[str] = None,
-        expires_in: int = 3600,
-        **kwargs: Any,
-    ) -> PresignedUrlResponse:
-        """Get a presigned URL for uploading an object.
-
-        Args:
-            bucket_id: The bucket ID.
-            key: Object key (path within the bucket).
-            content_type: MIME type of the file.
-            expires_in: URL expiry in seconds (default: 3600).
-            **kwargs: Additional parameters.
-
-        Returns:
-            PresignedUrlResponse with upload URL and headers.
-        """
-        payload: dict[str, Any] = {"key": key, "expires_in": expires_in}
-        if content_type is not None:
-            payload["content_type"] = content_type
-        payload.update(kwargs)
-
-        response = await self._request(
-            "POST",
-            f"/v1/storage/s3/buckets/{bucket_id}/objects/presign-upload",
-            json_data=payload,
-        )
-        return PresignedUrlResponse(**response.json())
-
-    async def presign_download(
-        self,
-        bucket_id: str,
-        *,
-        key: str,
-        expires_in: int = 3600,
-        **kwargs: Any,
-    ) -> PresignedUrlResponse:
-        """Get a presigned URL for downloading an object.
-
-        Args:
-            bucket_id: The bucket ID.
-            key: Object key (path within the bucket).
-            expires_in: URL expiry in seconds (default: 3600).
-            **kwargs: Additional parameters.
-
-        Returns:
-            PresignedUrlResponse with download URL.
-        """
-        payload: dict[str, Any] = {"key": key, "expires_in": expires_in}
-        payload.update(kwargs)
-
-        response = await self._request(
-            "POST",
-            f"/v1/storage/s3/buckets/{bucket_id}/objects/presign-download",
-            json_data=payload,
-        )
-        result = PresignedUrlResponse(**response.json())
-        result.method = "GET"
-        return result
-
-    # --- Lifecycle ---
+    # =========================================================================
+    # Lifecycle
+    # =========================================================================
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""
