@@ -1203,6 +1203,166 @@ class FotoHub(_BaseClient):
         return data.get("logs", data) if isinstance(data, dict) else data
 
     # =========================================================================
+    # Gabriel AI Orchestrator
+    # =========================================================================
+
+    def gabriel_classify(
+        self,
+        prompt: str,
+        *,
+        language: str = "en",
+        context: Optional[dict[str, Any]] = None,
+        enhance_prompt: bool = False,
+    ) -> dict[str, Any]:
+        """Classify user intent and route to the optimal platform feature.
+
+        Args:
+            prompt: Natural language request (max 1000 chars).
+            language: Language code (default: "en").
+            context: Additional context (user_tier, credits_remaining, etc.).
+            enhance_prompt: When True, enriches prompt with model-specific knowledge.
+
+        Returns:
+            Dict with action, target, params, model_selected, confidence,
+            credits_estimated, tips.
+        """
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "language": language,
+        }
+        if context is not None:
+            payload["context"] = context
+        if enhance_prompt:
+            payload["enhance_prompt"] = True
+
+        response = self._request("POST", "/v1/ai/gabriel", json_data=payload)
+        return response.json()
+
+    def gabriel_stream(
+        self,
+        prompt: str,
+        *,
+        language: str = "en",
+        context: Optional[dict[str, Any]] = None,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Stream orchestration results via SSE.
+
+        Args:
+            prompt: Natural language request.
+            language: Language code (default: "en").
+            context: Additional context.
+
+        Yields:
+            Dicts with type (thinking/routing/result) and payload.
+        """
+        import json as json_mod
+
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "language": language,
+        }
+        if context is not None:
+            payload["context"] = context
+
+        with self._client.stream(
+            "POST", "/v1/ai/gabriel/stream", json=payload
+        ) as response:
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    yield json_mod.loads(data)
+
+    def gabriel_suggest(
+        self,
+        partial: str,
+        *,
+        tab: str = "all",
+        page: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Get lightweight autocomplete suggestions (no auth required).
+
+        Args:
+            partial: Partial user input (min 2 chars).
+            tab: Current tab context ("all", "image", "video", "audio").
+            page: Current page path.
+
+        Returns:
+            List of suggestion dicts with text, category, target, icon.
+        """
+        payload: dict[str, Any] = {
+            "partial": partial,
+            "tab": tab,
+        }
+        if page is not None:
+            payload["page"] = page
+
+        response = self._request("POST", "/v1/ai/gabriel/suggest", json_data=payload)
+        data = response.json()
+        return data.get("suggestions", [])
+
+    def gabriel_recommend(
+        self,
+        *,
+        page: Optional[str] = None,
+        credits_remaining: Optional[int] = None,
+        has_brand: Optional[bool] = None,
+        recent_actions: Optional[list[str]] = None,
+    ) -> list[dict[str, Any]]:
+        """Get proactive context-aware recommendations (no auth required).
+
+        Args:
+            page: Current page path.
+            credits_remaining: User's credit balance.
+            has_brand: Whether user has a brand kit.
+            recent_actions: Last few actions taken.
+
+        Returns:
+            List of recommendation dicts with text, target, icon.
+        """
+        payload: dict[str, Any] = {}
+        if page is not None:
+            payload["page"] = page
+        if credits_remaining is not None:
+            payload["credits_remaining"] = credits_remaining
+        if has_brand is not None:
+            payload["has_brand"] = has_brand
+        if recent_actions is not None:
+            payload["recent_actions"] = recent_actions
+
+        response = self._request("POST", "/v1/ai/gabriel/recommend", json_data=payload)
+        data = response.json()
+        return data.get("recommendations", [])
+
+    def translate(
+        self,
+        text: str,
+        target_language: str,
+        *,
+        source_language: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Translate text between languages.
+
+        Args:
+            text: Text to translate (max 10,000 chars).
+            target_language: Target language code (e.g. "en", "pl", "de").
+            source_language: Source language (auto-detected if omitted).
+
+        Returns:
+            Dict with translated_text, source_language, target_language.
+        """
+        payload: dict[str, Any] = {
+            "text": text,
+            "target_language": target_language,
+        }
+        if source_language is not None:
+            payload["source_language"] = source_language
+
+        response = self._request("POST", "/v1/ai/translate", json_data=payload)
+        return response.json()
+
+    # =========================================================================
     # Convenience Helpers
     # =========================================================================
 
@@ -2306,6 +2466,95 @@ class AsyncFotoHub(_BaseClient):
         response = await self._request("GET", f"/v1/webhooks/{webhook_id}/logs")
         data = response.json()
         return data.get("logs", data) if isinstance(data, dict) else data
+
+    # =========================================================================
+    # Convenience Helpers
+    # =========================================================================
+
+    # =========================================================================
+    # Gabriel AI Orchestrator
+    # =========================================================================
+
+    async def gabriel_classify(
+        self,
+        prompt: str,
+        *,
+        language: str = "en",
+        context: Optional[dict[str, Any]] = None,
+        enhance_prompt: bool = False,
+    ) -> dict[str, Any]:
+        """Classify user intent and route to the optimal platform feature."""
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "language": language,
+        }
+        if context is not None:
+            payload["context"] = context
+        if enhance_prompt:
+            payload["enhance_prompt"] = True
+
+        response = await self._request("POST", "/v1/ai/gabriel", json_data=payload)
+        return response.json()
+
+    async def gabriel_suggest(
+        self,
+        partial: str,
+        *,
+        tab: str = "all",
+        page: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Get lightweight autocomplete suggestions (no auth required)."""
+        payload: dict[str, Any] = {
+            "partial": partial,
+            "tab": tab,
+        }
+        if page is not None:
+            payload["page"] = page
+
+        response = await self._request("POST", "/v1/ai/gabriel/suggest", json_data=payload)
+        data = response.json()
+        return data.get("suggestions", [])
+
+    async def gabriel_recommend(
+        self,
+        *,
+        page: Optional[str] = None,
+        credits_remaining: Optional[int] = None,
+        has_brand: Optional[bool] = None,
+        recent_actions: Optional[list[str]] = None,
+    ) -> list[dict[str, Any]]:
+        """Get proactive context-aware recommendations (no auth required)."""
+        payload: dict[str, Any] = {}
+        if page is not None:
+            payload["page"] = page
+        if credits_remaining is not None:
+            payload["credits_remaining"] = credits_remaining
+        if has_brand is not None:
+            payload["has_brand"] = has_brand
+        if recent_actions is not None:
+            payload["recent_actions"] = recent_actions
+
+        response = await self._request("POST", "/v1/ai/gabriel/recommend", json_data=payload)
+        data = response.json()
+        return data.get("recommendations", [])
+
+    async def translate(
+        self,
+        text: str,
+        target_language: str,
+        *,
+        source_language: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Translate text between languages."""
+        payload: dict[str, Any] = {
+            "text": text,
+            "target_language": target_language,
+        }
+        if source_language is not None:
+            payload["source_language"] = source_language
+
+        response = await self._request("POST", "/v1/ai/translate", json_data=payload)
+        return response.json()
 
     # =========================================================================
     # Convenience Helpers
