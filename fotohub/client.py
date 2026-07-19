@@ -32,7 +32,7 @@ DEFAULT_CHAT_MODEL = "gemini-flash"
 DEFAULT_BEDROCK_MODEL = "claude-sonnet-4.6"
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
-SDK_VERSION = "1.2.0"
+SDK_VERSION = "1.3.0"
 
 
 class _BaseClient:
@@ -897,6 +897,216 @@ class FotoHub(_BaseClient):
             Dict with list of invoices and their status.
         """
         response = self._request("GET", "/v1/billing/invoices")
+        return response.json()
+
+    # =========================================================================
+    # 3D Generation
+    # =========================================================================
+
+    def generate_3d(
+        self,
+        mode: str,
+        model: str,
+        *,
+        image: Optional[str] = None,
+        prompt: Optional[str] = None,
+        quality: str = "standard",
+        format: str = "glb",
+        options: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Generate a 3D model from an image or text prompt.
+
+        Args:
+            mode: Generation mode — "image-to-3d" or "text-to-3d".
+            model: 3D model to use ("triposr", "sf3d", "shap-e", "trellis", "hunyuan3d").
+            image: Base64-encoded image (required for image-to-3d).
+            prompt: Text prompt (required for text-to-3d).
+            quality: Output quality — "draft", "standard", "high".
+            format: Output file format — "glb", "obj", "stl", "usdz".
+            options: Additional options (texture, pbr, simplify, target_polys).
+
+        Returns:
+            Dict with id, url, format, status, billing info.
+        """
+        payload: dict[str, Any] = {
+            "mode": mode,
+            "model": model,
+            "quality": quality,
+            "format": format,
+        }
+        if image is not None:
+            payload["image_base64"] = image
+        if prompt is not None:
+            payload["prompt"] = prompt
+        if options is not None:
+            payload["options"] = options
+
+        response = self._request("POST", "/v1/ai/generate/3d", json_data=payload)
+        return response.json()
+
+    def get_3d_status(self, job_id: str) -> dict[str, Any]:
+        """Check the status of a 3D generation job.
+
+        Args:
+            job_id: The generation ID returned from generate_3d().
+
+        Returns:
+            Dict with status, url (if completed), and billing info.
+        """
+        response = self._request("GET", f"/v1/ai/generate/3d/{job_id}")
+        return response.json()
+
+    def wait_for_3d(
+        self,
+        job_id: str,
+        *,
+        poll_interval: float = 3.0,
+        timeout: float = 120.0,
+    ) -> dict[str, Any]:
+        """Wait for a 3D generation job to complete, polling at intervals.
+
+        Args:
+            job_id: The generation ID returned from generate_3d().
+            poll_interval: Seconds between status checks (default: 3.0).
+            timeout: Maximum wait time in seconds (default: 120.0).
+
+        Returns:
+            Dict with completed result including url and billing.
+
+        Raises:
+            TimeoutError: If the job doesn't complete within timeout.
+            FotoHubError: If the job fails.
+        """
+        start = time.time()
+        while True:
+            elapsed = time.time() - start
+            if elapsed >= timeout:
+                raise TimeoutError(
+                    message=f"3D generation job {job_id} timed out after {timeout}s"
+                )
+
+            result = self.get_3d_status(job_id)
+            status = result.get("status", "")
+
+            if status == "completed":
+                return result
+            if status == "failed":
+                raise FotoHubError(
+                    message=f"3D generation job {job_id} failed",
+                    status_code=500,
+                    response_body=result,
+                )
+
+            time.sleep(poll_interval)
+
+    def list_3d_models(self) -> list[dict[str, Any]]:
+        """List available 3D generation models with capabilities and pricing.
+
+        Returns:
+            List of 3D models with id, name, credits, speed, mode, quality.
+        """
+        response = self._request("GET", "/v1/ai/generate/3d/models")
+        data = response.json()
+        return data.get("models", data) if isinstance(data, dict) else data
+
+    # =========================================================================
+    # Tier Management
+    # =========================================================================
+
+    def get_tier_catalog(self) -> dict[str, Any]:
+        """Get the full tier catalog (PAYG + subscription tiers).
+
+        Returns:
+            Dict with tiers list containing slug, name, type, rpm, credits, price.
+        """
+        response = self._request("GET", "/v1/tiers/catalog")
+        return response.json()
+
+    def get_current_tier(self) -> dict[str, Any]:
+        """Get the current user's tier, limits, and usage stats.
+
+        Returns:
+            Dict with tier slug, name, limits (rpm, daily_quota, credits_monthly),
+            and usage (rpm_used, daily_used, credits_used).
+        """
+        response = self._request("GET", "/v1/tiers/current")
+        return response.json()
+
+    def compare_tiers(self) -> dict[str, Any]:
+        """Compare all tiers side-by-side with the current tier highlighted.
+
+        Returns:
+            Dict with current tier slug and full tier comparison data.
+        """
+        response = self._request("GET", "/v1/tiers/compare")
+        return response.json()
+
+    def subscribe_tier(self, tier_slug: str) -> dict[str, Any]:
+        """Subscribe to a tier (returns checkout URL for payment).
+
+        Args:
+            tier_slug: Tier identifier (e.g. "sub-developer", "sub-startup").
+
+        Returns:
+            Dict with checkout_url for completing the subscription.
+        """
+        payload: dict[str, Any] = {"tier": tier_slug}
+        response = self._request("POST", "/v1/tiers/subscribe", json_data=payload)
+        return response.json()
+
+    def get_wallet(self) -> dict[str, Any]:
+        """Get the current wallet balance and spending info.
+
+        Returns:
+            Dict with balance, currency, lifetime_spend, auto_topup.
+        """
+        response = self._request("GET", "/v1/tiers/wallet")
+        return response.json()
+
+    def topup_wallet(self, amount: float) -> dict[str, Any]:
+        """Top up wallet balance (returns payment session URL).
+
+        Args:
+            amount: Amount in PLN to add.
+
+        Returns:
+            Dict with session_url for completing payment.
+        """
+        payload: dict[str, Any] = {"amount": amount}
+        response = self._request("POST", "/v1/tiers/wallet/topup", json_data=payload)
+        return response.json()
+
+    def apply_enterprise(
+        self,
+        company_name: str,
+        contact_email: str,
+        expected_usage: str,
+        use_case: str,
+        *,
+        notes: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Submit an enterprise tier application.
+
+        Args:
+            company_name: Company or organization name.
+            contact_email: Contact email for follow-up.
+            expected_usage: Expected monthly usage description.
+            use_case: Primary use case description.
+            notes: Additional notes or requirements.
+
+        Returns:
+            Dict with application id and status.
+        """
+        payload: dict[str, Any] = {
+            "company_name": company_name,
+            "contact_email": contact_email,
+            "expected_usage": expected_usage,
+            "use_case": use_case,
+        }
+        if notes is not None:
+            payload["notes"] = notes
+
+        response = self._request("POST", "/v1/tiers/enterprise/apply", json_data=payload)
         return response.json()
 
     # =========================================================================
@@ -1869,6 +2079,139 @@ class AsyncFotoHub(_BaseClient):
             Dict with list of invoices and their status.
         """
         response = await self._request("GET", "/v1/billing/invoices")
+        return response.json()
+
+    # =========================================================================
+    # 3D Generation
+    # =========================================================================
+
+    async def generate_3d(
+        self,
+        mode: str,
+        model: str,
+        *,
+        image: Optional[str] = None,
+        prompt: Optional[str] = None,
+        quality: str = "standard",
+        format: str = "glb",
+        options: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Generate a 3D model from an image or text prompt."""
+        payload: dict[str, Any] = {
+            "mode": mode,
+            "model": model,
+            "quality": quality,
+            "format": format,
+        }
+        if image is not None:
+            payload["image_base64"] = image
+        if prompt is not None:
+            payload["prompt"] = prompt
+        if options is not None:
+            payload["options"] = options
+
+        response = await self._request("POST", "/v1/ai/generate/3d", json_data=payload)
+        return response.json()
+
+    async def get_3d_status(self, job_id: str) -> dict[str, Any]:
+        """Check the status of a 3D generation job."""
+        response = await self._request("GET", f"/v1/ai/generate/3d/{job_id}")
+        return response.json()
+
+    async def wait_for_3d(
+        self,
+        job_id: str,
+        *,
+        poll_interval: float = 3.0,
+        timeout: float = 120.0,
+    ) -> dict[str, Any]:
+        """Wait for a 3D generation job to complete."""
+        import asyncio
+
+        start = time.time()
+        while True:
+            elapsed = time.time() - start
+            if elapsed >= timeout:
+                raise TimeoutError(
+                    message=f"3D generation job {job_id} timed out after {timeout}s"
+                )
+
+            result = await self.get_3d_status(job_id)
+            status = result.get("status", "")
+
+            if status == "completed":
+                return result
+            if status == "failed":
+                raise FotoHubError(
+                    message=f"3D generation job {job_id} failed",
+                    status_code=500,
+                    response_body=result,
+                )
+
+            await asyncio.sleep(poll_interval)
+
+    async def list_3d_models(self) -> list[dict[str, Any]]:
+        """List available 3D generation models."""
+        response = await self._request("GET", "/v1/ai/generate/3d/models")
+        data = response.json()
+        return data.get("models", data) if isinstance(data, dict) else data
+
+    # =========================================================================
+    # Tier Management
+    # =========================================================================
+
+    async def get_tier_catalog(self) -> dict[str, Any]:
+        """Get the full tier catalog."""
+        response = await self._request("GET", "/v1/tiers/catalog")
+        return response.json()
+
+    async def get_current_tier(self) -> dict[str, Any]:
+        """Get the current user's tier, limits, and usage."""
+        response = await self._request("GET", "/v1/tiers/current")
+        return response.json()
+
+    async def compare_tiers(self) -> dict[str, Any]:
+        """Compare all tiers side-by-side."""
+        response = await self._request("GET", "/v1/tiers/compare")
+        return response.json()
+
+    async def subscribe_tier(self, tier_slug: str) -> dict[str, Any]:
+        """Subscribe to a tier."""
+        payload: dict[str, Any] = {"tier": tier_slug}
+        response = await self._request("POST", "/v1/tiers/subscribe", json_data=payload)
+        return response.json()
+
+    async def get_wallet(self) -> dict[str, Any]:
+        """Get the current wallet balance."""
+        response = await self._request("GET", "/v1/tiers/wallet")
+        return response.json()
+
+    async def topup_wallet(self, amount: float) -> dict[str, Any]:
+        """Top up wallet balance."""
+        payload: dict[str, Any] = {"amount": amount}
+        response = await self._request("POST", "/v1/tiers/wallet/topup", json_data=payload)
+        return response.json()
+
+    async def apply_enterprise(
+        self,
+        company_name: str,
+        contact_email: str,
+        expected_usage: str,
+        use_case: str,
+        *,
+        notes: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Submit an enterprise tier application."""
+        payload: dict[str, Any] = {
+            "company_name": company_name,
+            "contact_email": contact_email,
+            "expected_usage": expected_usage,
+            "use_case": use_case,
+        }
+        if notes is not None:
+            payload["notes"] = notes
+
+        response = await self._request("POST", "/v1/tiers/enterprise/apply", json_data=payload)
         return response.json()
 
     # =========================================================================
