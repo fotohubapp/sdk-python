@@ -32,7 +32,7 @@ from .exceptions import (
 )
 from .streaming import AsyncChatStream, ChatStream
 
-__version__ = "1.2.0"
+__version__ = "1.4.0"
 
 __all__ = [
     # Clients

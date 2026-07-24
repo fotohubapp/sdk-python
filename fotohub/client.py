@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import time
+import warnings
 from typing import Any, Generator, Optional, Union
 
 import httpx
@@ -19,7 +20,6 @@ from .exceptions import (
     ServerError,
     TimeoutError,
     ValidationError,
-    VideoJobTimeoutError,
 )
 from .streaming import AsyncChatStream, ChatStream
 
@@ -29,10 +29,12 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_IMAGE_MODEL = "seedream-5-0-260128"
 DEFAULT_VIDEO_MODEL = "veo-2"
 DEFAULT_CHAT_MODEL = "gemini-flash"
-DEFAULT_BEDROCK_MODEL = "claude-sonnet-4.6"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4.6"
+# Backwards-compat alias — prefer DEFAULT_CLAUDE_MODEL.
+DEFAULT_BEDROCK_MODEL = DEFAULT_CLAUDE_MODEL
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
-SDK_VERSION = "1.3.0"
+SDK_VERSION = "1.4.0"
 
 
 class _BaseClient:
@@ -291,7 +293,11 @@ class FotoHub(_BaseClient):
         image_url: Optional[str] = None,
         resolution: str = "1080p",
     ) -> dict[str, Any]:
-        """Start an asynchronous video generation job.
+        """Generate a video (synchronous — blocks until the video is ready).
+
+        The request holds open until generation finishes, so the returned dict
+        already contains the finished ``video_url``. There is no separate job to
+        poll; :meth:`wait_for_video` is unnecessary.
 
         Args:
             prompt: Text description of the desired video.
@@ -302,7 +308,7 @@ class FotoHub(_BaseClient):
             resolution: Output resolution ("720p", "1080p", "4k").
 
         Returns:
-            Dict with job_id and initial status.
+            Dict with model, credits_used, video_url, job_id, status, duration.
         """
         payload: dict[str, Any] = {
             "prompt": prompt,
@@ -469,26 +475,26 @@ class FotoHub(_BaseClient):
         }
 
         if stream:
-            response = self._request("POST", "/v1/ai/chat", json_data=payload, stream=True)
+            response = self._request("POST", "/v1/ai/chat/completions", json_data=payload, stream=True)
             return ChatStream(response)
 
-        response = self._request("POST", "/v1/ai/chat", json_data=payload)
+        response = self._request("POST", "/v1/ai/chat/completions", json_data=payload)
         return response.json()
 
-    def chat_bedrock(
+    def chat_claude(
         self,
         messages: list[dict[str, str]],
         *,
-        model: str = DEFAULT_BEDROCK_MODEL,
+        model: str = DEFAULT_CLAUDE_MODEL,
         temperature: float = 0.7,
         max_tokens: int = 4096,
         system: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Send a chat request via AWS Bedrock (Claude/Anthropic models).
+        """Send a chat request to a premium Claude (Anthropic) model.
 
         Args:
             messages: List of message dicts with ``role`` and ``content``.
-            model: Bedrock model ID (default: claude-sonnet-4.6).
+            model: Claude model ID (default: claude-sonnet-4.6).
             temperature: Sampling temperature (0-1).
             max_tokens: Maximum tokens in the response.
             system: System prompt (prepended to conversation).
@@ -505,8 +511,36 @@ class FotoHub(_BaseClient):
         if system is not None:
             payload["system"] = system
 
-        response = self._request("POST", "/v1/ai/chat/bedrock", json_data=payload)
+        response = self._request("POST", "/v1/ai/chat/claude", json_data=payload)
         return response.json()
+
+    def chat_bedrock(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        model: str = DEFAULT_CLAUDE_MODEL,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        system: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Deprecated alias for :meth:`chat_claude`.
+
+        .. deprecated:: 1.4.0
+            Use :meth:`chat_claude` instead. This method will be removed in a
+            future release.
+        """
+        warnings.warn(
+            "chat_bedrock() is deprecated; use chat_claude() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.chat_claude(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system=system,
+        )
 
     def analyze_image(
         self,
@@ -566,7 +600,7 @@ class FotoHub(_BaseClient):
         Returns:
             List of tool descriptors with id, name, description, parameters.
         """
-        response = self._request("GET", "/v1/ai/stability/tools")
+        response = self._request("GET", "/stability/tools")
         data = response.json()
         return data.get("tools", data) if isinstance(data, dict) else data
 
@@ -600,7 +634,6 @@ class FotoHub(_BaseClient):
             Dict with output image (base64 or URL), seed, credits_used.
         """
         payload: dict[str, Any] = {
-            "tool_id": tool_id,
             "image": image_base64,
             "output_format": output_format,
         }
@@ -616,7 +649,7 @@ class FotoHub(_BaseClient):
             payload["negative_prompt"] = negative_prompt
         payload.update(kwargs)
 
-        response = self._request("POST", "/v1/ai/stability/run", json_data=payload)
+        response = self._request("POST", f"/stability/{tool_id}", json_data=payload)
         return response.json()
 
     def stability_upscale(
@@ -624,17 +657,21 @@ class FotoHub(_BaseClient):
         image_base64: str,
         *,
         type: str = "fast",
+        prompt: Optional[str] = None,
     ) -> dict[str, Any]:
         """Upscale an image using Stability AI.
 
         Args:
             image_base64: Base64-encoded input image.
-            type: Upscale type — "fast" (2x, instant) or "creative" (4x, slower).
+            type: Upscale type — "fast" (4x, instant), "creative" (4x, slower,
+                prompt-guided) or "conservative" (4x, faithful).
+            prompt: Optional guiding prompt (used by creative/conservative).
 
         Returns:
             Dict with upscaled image data.
         """
-        return self.stability_run("upscale", image_base64, type=type)
+        tool_id = f"{type}-upscale"
+        return self.stability_run(tool_id, image_base64, prompt=prompt)
 
     def stability_remove_background(
         self,
@@ -664,7 +701,7 @@ class FotoHub(_BaseClient):
         Returns:
             Dict with result image data.
         """
-        return self.stability_run("erase", image_base64, mask=mask_base64)
+        return self.stability_run("erase-object", image_base64, mask=mask_base64)
 
     def stability_inpaint(
         self,
@@ -726,7 +763,7 @@ class FotoHub(_BaseClient):
             Dict with result image data.
         """
         return self.stability_run(
-            "search-and-replace", image_base64, prompt=prompt, search_prompt=search_prompt
+            "search-replace", image_base64, prompt=prompt, search_prompt=search_prompt
         )
 
     def stability_recolor(
@@ -746,7 +783,7 @@ class FotoHub(_BaseClient):
             Dict with recolored image data.
         """
         return self.stability_run(
-            "recolor", image_base64, prompt=prompt, search_prompt=search_prompt
+            "search-recolor", image_base64, prompt=prompt, search_prompt=search_prompt
         )
 
     def stability_style_transfer(
@@ -824,7 +861,7 @@ class FotoHub(_BaseClient):
         if project_id is not None:
             payload["project_id"] = project_id
 
-        response = self._request("POST", "/v1/billing/overage-limit", json_data=payload)
+        response = self._request("PUT", "/v1/billing/overage-limit", json_data=payload)
         return response.json()
 
     def get_topup_packages(self) -> list[dict[str, Any]]:
@@ -841,10 +878,11 @@ class FotoHub(_BaseClient):
         """Purchase a credit top-up package.
 
         Args:
-            package: Package identifier (e.g. "starter", "pro", "enterprise").
+            package: Package slug (e.g. "topup-50", "topup-100", "topup-250",
+                "topup-500", "topup-1000", "topup-5000").
 
         Returns:
-            Dict with payment URL or confirmation.
+            Dict with checkout_url and the purchased package descriptor.
         """
         payload: dict[str, Any] = {"package": package}
 
@@ -1119,7 +1157,7 @@ class FotoHub(_BaseClient):
         Returns:
             List of webhook configurations.
         """
-        response = self._request("GET", "/v1/webhooks")
+        response = self._request("GET", "/v1/console/webhooks")
         data = response.json()
         return data.get("webhooks", data) if isinstance(data, dict) else data
 
@@ -1151,7 +1189,7 @@ class FotoHub(_BaseClient):
         if headers is not None:
             payload["headers"] = headers
 
-        response = self._request("POST", "/v1/webhooks", json_data=payload)
+        response = self._request("POST", "/v1/console/webhooks", json_data=payload)
         return response.json()
 
     def update_webhook(self, webhook_id: str, **kwargs: Any) -> dict[str, Any]:
@@ -1165,7 +1203,7 @@ class FotoHub(_BaseClient):
             Dict with updated webhook configuration.
         """
         response = self._request(
-            "PATCH", f"/v1/webhooks/{webhook_id}", json_data=kwargs
+            "PATCH", f"/v1/console/webhooks/{webhook_id}", json_data=kwargs
         )
         return response.json()
 
@@ -1175,7 +1213,7 @@ class FotoHub(_BaseClient):
         Args:
             webhook_id: The webhook identifier.
         """
-        self._request("DELETE", f"/v1/webhooks/{webhook_id}")
+        self._request("DELETE", f"/v1/console/webhooks/{webhook_id}")
 
     def test_webhook(self, webhook_id: str) -> dict[str, Any]:
         """Send a test event to a webhook endpoint.
@@ -1186,7 +1224,7 @@ class FotoHub(_BaseClient):
         Returns:
             Dict with delivery status and response code.
         """
-        response = self._request("POST", f"/v1/webhooks/{webhook_id}/test")
+        response = self._request("POST", f"/v1/console/webhooks/{webhook_id}/test")
         return response.json()
 
     def get_webhook_logs(self, webhook_id: str) -> list[dict[str, Any]]:
@@ -1198,7 +1236,7 @@ class FotoHub(_BaseClient):
         Returns:
             List of delivery log entries with status, timestamp, response.
         """
-        response = self._request("GET", f"/v1/webhooks/{webhook_id}/logs")
+        response = self._request("GET", f"/v1/console/webhooks/{webhook_id}/logs")
         data = response.json()
         return data.get("logs", data) if isinstance(data, dict) else data
 
@@ -1393,42 +1431,40 @@ class FotoHub(_BaseClient):
 
     def wait_for_video(
         self,
-        job_id: str,
+        result: Union[str, dict[str, Any]],
         *,
         poll_interval: float = 5.0,
         timeout: float = 300.0,
     ) -> dict[str, Any]:
-        """Poll a video generation job until completion or timeout.
+        """Return a finished video result.
+
+        .. deprecated:: 1.4.0
+            Video generation is synchronous — :meth:`generate_video` already
+            returns the finished ``video_url``, so there is no job to poll. This
+            method now just returns the result dict from :meth:`generate_video`
+            unchanged, and will be removed in a future release.
 
         Args:
-            job_id: The job ID from generate_video().
-            poll_interval: Seconds between status checks (default: 5).
-            timeout: Maximum seconds to wait (default: 300).
+            result: The dict returned by :meth:`generate_video`.
+            poll_interval: Unused (kept for backwards compatibility).
+            timeout: Unused (kept for backwards compatibility).
 
         Returns:
-            Dict with final job status and video_url if completed.
-
-        Raises:
-            VideoJobTimeoutError: If timeout is exceeded.
+            The finished video result dict.
         """
-        start_time = time.time()
-
-        while True:
-            elapsed = time.time() - start_time
-            if elapsed >= timeout:
-                raise VideoJobTimeoutError(
-                    message=f"Video job {job_id} did not complete within {timeout}s",
-                    job_id=job_id,
-                )
-
-            response = self._request("GET", f"/v1/ai/generate/video/{job_id}")
-            job = response.json()
-
-            status = job.get("status", "")
-            if status in ("completed", "failed"):
-                return job
-
-            time.sleep(poll_interval)
+        warnings.warn(
+            "wait_for_video() is deprecated; generate_video() is synchronous and "
+            "already returns the finished video_url.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if isinstance(result, dict):
+            return result
+        raise FotoHubError(
+            "wait_for_video() no longer accepts a job_id: video generation is "
+            "synchronous. Pass the dict returned by generate_video() (or just "
+            "read its 'video_url')."
+        )
 
     # =========================================================================
     # Lifecycle
@@ -1625,7 +1661,11 @@ class AsyncFotoHub(_BaseClient):
         image_url: Optional[str] = None,
         resolution: str = "1080p",
     ) -> dict[str, Any]:
-        """Start an asynchronous video generation job.
+        """Generate a video (awaits until the video is ready).
+
+        The request holds open until generation finishes, so the returned dict
+        already contains the finished ``video_url``. There is no separate job to
+        poll; :meth:`wait_for_video` is unnecessary.
 
         Args:
             prompt: Text description of the desired video.
@@ -1636,7 +1676,7 @@ class AsyncFotoHub(_BaseClient):
             resolution: Output resolution ("720p", "1080p", "4k").
 
         Returns:
-            Dict with job_id and initial status.
+            Dict with model, credits_used, video_url, job_id, status, duration.
         """
         payload: dict[str, Any] = {
             "prompt": prompt,
@@ -1804,27 +1844,27 @@ class AsyncFotoHub(_BaseClient):
 
         if stream:
             response = await self._request(
-                "POST", "/v1/ai/chat", json_data=payload, stream=True
+                "POST", "/v1/ai/chat/completions", json_data=payload, stream=True
             )
             return AsyncChatStream(response)
 
-        response = await self._request("POST", "/v1/ai/chat", json_data=payload)
+        response = await self._request("POST", "/v1/ai/chat/completions", json_data=payload)
         return response.json()
 
-    async def chat_bedrock(
+    async def chat_claude(
         self,
         messages: list[dict[str, str]],
         *,
-        model: str = DEFAULT_BEDROCK_MODEL,
+        model: str = DEFAULT_CLAUDE_MODEL,
         temperature: float = 0.7,
         max_tokens: int = 4096,
         system: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Send a chat request via AWS Bedrock (Claude/Anthropic models).
+        """Send a chat request to a premium Claude (Anthropic) model.
 
         Args:
             messages: List of message dicts with ``role`` and ``content``.
-            model: Bedrock model ID (default: claude-sonnet-4.6).
+            model: Claude model ID (default: claude-sonnet-4.6).
             temperature: Sampling temperature (0-1).
             max_tokens: Maximum tokens in the response.
             system: System prompt (prepended to conversation).
@@ -1841,8 +1881,36 @@ class AsyncFotoHub(_BaseClient):
         if system is not None:
             payload["system"] = system
 
-        response = await self._request("POST", "/v1/ai/chat/bedrock", json_data=payload)
+        response = await self._request("POST", "/v1/ai/chat/claude", json_data=payload)
         return response.json()
+
+    async def chat_bedrock(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        model: str = DEFAULT_CLAUDE_MODEL,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        system: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Deprecated alias for :meth:`chat_claude`.
+
+        .. deprecated:: 1.4.0
+            Use :meth:`chat_claude` instead. This method will be removed in a
+            future release.
+        """
+        warnings.warn(
+            "chat_bedrock() is deprecated; use chat_claude() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return await self.chat_claude(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system=system,
+        )
 
     async def analyze_image(
         self,
@@ -1902,7 +1970,7 @@ class AsyncFotoHub(_BaseClient):
         Returns:
             List of tool descriptors with id, name, description, parameters.
         """
-        response = await self._request("GET", "/v1/ai/stability/tools")
+        response = await self._request("GET", "/stability/tools")
         data = response.json()
         return data.get("tools", data) if isinstance(data, dict) else data
 
@@ -1936,7 +2004,6 @@ class AsyncFotoHub(_BaseClient):
             Dict with output image (base64 or URL), seed, credits_used.
         """
         payload: dict[str, Any] = {
-            "tool_id": tool_id,
             "image": image_base64,
             "output_format": output_format,
         }
@@ -1952,7 +2019,7 @@ class AsyncFotoHub(_BaseClient):
             payload["negative_prompt"] = negative_prompt
         payload.update(kwargs)
 
-        response = await self._request("POST", "/v1/ai/stability/run", json_data=payload)
+        response = await self._request("POST", f"/stability/{tool_id}", json_data=payload)
         return response.json()
 
     async def stability_upscale(
@@ -1960,17 +2027,21 @@ class AsyncFotoHub(_BaseClient):
         image_base64: str,
         *,
         type: str = "fast",
+        prompt: Optional[str] = None,
     ) -> dict[str, Any]:
         """Upscale an image using Stability AI.
 
         Args:
             image_base64: Base64-encoded input image.
-            type: Upscale type — "fast" (2x, instant) or "creative" (4x, slower).
+            type: Upscale type — "fast" (4x, instant), "creative" (4x, slower,
+                prompt-guided) or "conservative" (4x, faithful).
+            prompt: Optional guiding prompt (used by creative/conservative).
 
         Returns:
             Dict with upscaled image data.
         """
-        return await self.stability_run("upscale", image_base64, type=type)
+        tool_id = f"{type}-upscale"
+        return await self.stability_run(tool_id, image_base64, prompt=prompt)
 
     async def stability_remove_background(
         self,
@@ -2000,7 +2071,7 @@ class AsyncFotoHub(_BaseClient):
         Returns:
             Dict with result image data.
         """
-        return await self.stability_run("erase", image_base64, mask=mask_base64)
+        return await self.stability_run("erase-object", image_base64, mask=mask_base64)
 
     async def stability_inpaint(
         self,
@@ -2064,7 +2135,7 @@ class AsyncFotoHub(_BaseClient):
             Dict with result image data.
         """
         return await self.stability_run(
-            "search-and-replace", image_base64, prompt=prompt, search_prompt=search_prompt
+            "search-replace", image_base64, prompt=prompt, search_prompt=search_prompt
         )
 
     async def stability_recolor(
@@ -2084,7 +2155,7 @@ class AsyncFotoHub(_BaseClient):
             Dict with recolored image data.
         """
         return await self.stability_run(
-            "recolor", image_base64, prompt=prompt, search_prompt=search_prompt
+            "search-recolor", image_base64, prompt=prompt, search_prompt=search_prompt
         )
 
     async def stability_style_transfer(
@@ -2165,7 +2236,7 @@ class AsyncFotoHub(_BaseClient):
             payload["project_id"] = project_id
 
         response = await self._request(
-            "POST", "/v1/billing/overage-limit", json_data=payload
+            "PUT", "/v1/billing/overage-limit", json_data=payload
         )
         return response.json()
 
@@ -2183,10 +2254,11 @@ class AsyncFotoHub(_BaseClient):
         """Purchase a credit top-up package.
 
         Args:
-            package: Package identifier (e.g. "starter", "pro", "enterprise").
+            package: Package slug (e.g. "topup-50", "topup-100", "topup-250",
+                "topup-500", "topup-1000", "topup-5000").
 
         Returns:
-            Dict with payment URL or confirmation.
+            Dict with checkout_url and the purchased package descriptor.
         """
         payload: dict[str, Any] = {"package": package}
 
@@ -2384,7 +2456,7 @@ class AsyncFotoHub(_BaseClient):
         Returns:
             List of webhook configurations.
         """
-        response = await self._request("GET", "/v1/webhooks")
+        response = await self._request("GET", "/v1/console/webhooks")
         data = response.json()
         return data.get("webhooks", data) if isinstance(data, dict) else data
 
@@ -2416,7 +2488,7 @@ class AsyncFotoHub(_BaseClient):
         if headers is not None:
             payload["headers"] = headers
 
-        response = await self._request("POST", "/v1/webhooks", json_data=payload)
+        response = await self._request("POST", "/v1/console/webhooks", json_data=payload)
         return response.json()
 
     async def update_webhook(self, webhook_id: str, **kwargs: Any) -> dict[str, Any]:
@@ -2430,7 +2502,7 @@ class AsyncFotoHub(_BaseClient):
             Dict with updated webhook configuration.
         """
         response = await self._request(
-            "PATCH", f"/v1/webhooks/{webhook_id}", json_data=kwargs
+            "PATCH", f"/v1/console/webhooks/{webhook_id}", json_data=kwargs
         )
         return response.json()
 
@@ -2440,7 +2512,7 @@ class AsyncFotoHub(_BaseClient):
         Args:
             webhook_id: The webhook identifier.
         """
-        await self._request("DELETE", f"/v1/webhooks/{webhook_id}")
+        await self._request("DELETE", f"/v1/console/webhooks/{webhook_id}")
 
     async def test_webhook(self, webhook_id: str) -> dict[str, Any]:
         """Send a test event to a webhook endpoint.
@@ -2451,7 +2523,7 @@ class AsyncFotoHub(_BaseClient):
         Returns:
             Dict with delivery status and response code.
         """
-        response = await self._request("POST", f"/v1/webhooks/{webhook_id}/test")
+        response = await self._request("POST", f"/v1/console/webhooks/{webhook_id}/test")
         return response.json()
 
     async def get_webhook_logs(self, webhook_id: str) -> list[dict[str, Any]]:
@@ -2463,7 +2535,7 @@ class AsyncFotoHub(_BaseClient):
         Returns:
             List of delivery log entries with status, timestamp, response.
         """
-        response = await self._request("GET", f"/v1/webhooks/{webhook_id}/logs")
+        response = await self._request("GET", f"/v1/console/webhooks/{webhook_id}/logs")
         data = response.json()
         return data.get("logs", data) if isinstance(data, dict) else data
 
@@ -2587,44 +2659,40 @@ class AsyncFotoHub(_BaseClient):
 
     async def wait_for_video(
         self,
-        job_id: str,
+        result: Union[str, dict[str, Any]],
         *,
         poll_interval: float = 5.0,
         timeout: float = 300.0,
     ) -> dict[str, Any]:
-        """Poll a video generation job until completion or timeout.
+        """Return a finished video result.
+
+        .. deprecated:: 1.4.0
+            Video generation is synchronous — :meth:`generate_video` already
+            returns the finished ``video_url``, so there is no job to poll. This
+            method now just returns the result dict from :meth:`generate_video`
+            unchanged, and will be removed in a future release.
 
         Args:
-            job_id: The job ID from generate_video().
-            poll_interval: Seconds between status checks (default: 5).
-            timeout: Maximum seconds to wait (default: 300).
+            result: The dict returned by :meth:`generate_video`.
+            poll_interval: Unused (kept for backwards compatibility).
+            timeout: Unused (kept for backwards compatibility).
 
         Returns:
-            Dict with final job status and video_url if completed.
-
-        Raises:
-            VideoJobTimeoutError: If timeout is exceeded.
+            The finished video result dict.
         """
-        import asyncio
-
-        start_time = time.time()
-
-        while True:
-            elapsed = time.time() - start_time
-            if elapsed >= timeout:
-                raise VideoJobTimeoutError(
-                    message=f"Video job {job_id} did not complete within {timeout}s",
-                    job_id=job_id,
-                )
-
-            response = await self._request("GET", f"/v1/ai/generate/video/{job_id}")
-            job = response.json()
-
-            status = job.get("status", "")
-            if status in ("completed", "failed"):
-                return job
-
-            await asyncio.sleep(poll_interval)
+        warnings.warn(
+            "wait_for_video() is deprecated; generate_video() is synchronous and "
+            "already returns the finished video_url.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if isinstance(result, dict):
+            return result
+        raise FotoHubError(
+            "wait_for_video() no longer accepts a job_id: video generation is "
+            "synchronous. Pass the dict returned by generate_video() (or just "
+            "read its 'video_url')."
+        )
 
     # =========================================================================
     # Lifecycle
