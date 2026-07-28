@@ -34,7 +34,7 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4.6"
 DEFAULT_BEDROCK_MODEL = DEFAULT_CLAUDE_MODEL
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
-SDK_VERSION = "1.6.0"
+SDK_VERSION = "1.7.0"
 
 
 class _BaseClient:
@@ -1026,7 +1026,7 @@ class FotoHub(_BaseClient):
 
         Args:
             mode: Generation mode — "image-to-3d" or "text-to-3d".
-            model: 3D model to use ("triposr", "sf3d", "shap-e", "trellis", "hunyuan3d").
+            model: 3D model to use ("fh-lite-3d", "fh-text-3d", "fh-pro-3d").
             image: Base64-encoded image (required for image-to-3d).
             prompt: Text prompt (required for text-to-3d).
             quality: Output quality — "draft", "standard", "high".
