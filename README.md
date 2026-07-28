@@ -26,6 +26,7 @@
 - **Image Generation** — 25+ models including SeedDream 5.0, Flux, SDXL, Midjourney-style, and more
 - **Video Generation** — Async job-based video creation with polling and image-to-video
 - **Music Generation** — AI-powered music and audio creation
+- **Virtual Try-On** — dress a person photo in a garment, or a full top + bottom outfit in one call
 - **Chat / LLM** — OpenAI-compatible chat completions with streaming support
 - **Gabriel AI** — Intent orchestration engine for natural-language workflows
 - **Storage** — S3 bucket provisioning with presigned upload/download URLs
@@ -154,6 +155,48 @@ print(f"Audio: {result.audio.url}")
 print(f"Duration: {result.audio.duration}s")
 print(f"Credits used: {result.credits_used}")
 ```
+
+### Virtual Try-On
+
+A try-on is a job, not a blocking call: a render takes about 11 seconds, so you submit and then wait.
+
+```python
+from fotohub import FotoHub
+
+client = FotoHub(api_key="fh_live_...")
+
+job = client.tryon(
+    person_image_url="https://example.com/person.jpg",
+    garment_image_url="https://example.com/shirt.png",
+    category="tops",              # "tops" | "bottoms" | "one-pieces"
+    garment_photo_type="flat-lay",
+)
+result = client.wait_for_tryon(job["job_id"])
+print(result["images"][0])
+```
+
+Pass `garments` to dress a top **and** a bottom in one job. The API applies the top first, feeds
+that render into the second pass, and charges 3 credits instead of 4:
+
+```python
+job = client.tryon(
+    person_image_url="https://example.com/person.jpg",
+    garments=[
+        {"garment_image_url": "https://example.com/tee.png", "category": "tops"},
+        {"garment_id": "0f1e2d3c-...", "category": "bottoms"},   # or a catalogue id
+    ],
+)
+result = client.wait_for_tryon(job["job_id"], timeout=60)
+
+# If the second pass failed, the top-only render still comes back and one credit
+# is refunded — so check before calling it a finished outfit.
+partial = (result.get("metadata") or {}).get("partial_failure")
+if partial:
+    print(f"The {partial['slot']} is missing:", result["images"][0])
+```
+
+Exactly one top plus one bottom is required — two tops, three garments, or a `one-pieces` in the
+array are rejected with `400`. Hats and shoes are not supported by the model at all.
 
 ### Chat Completions (OpenAI-Compatible)
 

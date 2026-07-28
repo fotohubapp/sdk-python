@@ -34,7 +34,7 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4.6"
 DEFAULT_BEDROCK_MODEL = DEFAULT_CLAUDE_MODEL
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
-SDK_VERSION = "1.4.0"
+SDK_VERSION = "1.6.0"
 
 
 class _BaseClient:
@@ -248,6 +248,76 @@ class FotoHub(_BaseClient):
 
         response = self._request("POST", "/v1/ai/generate/image", json_data=payload)
         return response.json()
+
+    def generate_ida_q(
+        self,
+        prompt: str,
+        *,
+        aspect_ratio: str = "1:1",
+        image_size: str = "1K",
+        num_images: int = 1,
+        seed: Optional[int] = None,
+        poll_interval: float = 3.0,
+        timeout: float = 300.0,
+    ) -> dict[str, Any]:
+        """Generate an image with IDA Q 1.0, FOTOhub's proprietary image model.
+
+        Unlike :meth:`generate_image`, IDA Q 1.0 runs on a self-hosted, single-GPU
+        queue and is asynchronous — generation takes 30 seconds to ~3.5 minutes
+        depending on ``image_size``. This method submits the job and polls until
+        it completes, returning the finished result. Any prompt (including
+        non-English text) is automatically translated and restructured for best
+        results — see the `IDA Q 1.0 docs <https://docs.fotohub.app/api/ida-q>`_.
+
+        Args:
+            prompt: Text description of the desired image. Any language.
+            aspect_ratio: One of "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9".
+            image_size: Resolution tier — "1K" (~30s), "1.5K" (~90s), or "2K" (~3.5min).
+            num_images: Number of images to generate (1-2).
+            seed: Random seed for reproducibility.
+            poll_interval: Seconds to wait between status checks.
+            timeout: Maximum seconds to wait for completion before raising.
+
+        Returns:
+            Dict with ``images`` (list of URLs), ``model``, ``credits_used``.
+
+        Raises:
+            InsufficientCreditsError: If account lacks credits.
+            TimeoutError: If generation doesn't complete within ``timeout``.
+            FotoHubError: If generation fails server-side.
+        """
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "model": "ida-q-image",
+            "aspect_ratio": aspect_ratio,
+            "image_size": image_size,
+            "num_images": num_images,
+        }
+        if seed is not None:
+            payload["seed"] = seed
+
+        submit_response = self._request("POST", "/v1/ai/generate/image", json_data=payload)
+        job = submit_response.json()
+        job_id = job["job_id"]
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status_response = self._request("GET", f"/v1/ai/generate/image/ida-q/{job_id}")
+            status = status_response.json()
+            if status["status"] == "completed":
+                return {
+                    "model": "ida-q-image",
+                    "job_id": job_id,
+                    "credits_used": job.get("credits_used"),
+                    "billing": job.get("billing"),
+                    "images": status.get("images", []),
+                    "metadata": status.get("metadata"),
+                }
+            if status["status"] == "failed":
+                raise FotoHubError(status.get("error", "IDA Q 1.0 generation failed"))
+            time.sleep(poll_interval)
+
+        raise TimeoutError(message=f"IDA Q 1.0 job {job_id} did not complete within {timeout}s")
 
     def edit_image(
         self,
@@ -1048,6 +1118,131 @@ class FotoHub(_BaseClient):
         return data.get("models", data) if isinstance(data, dict) else data
 
     # =========================================================================
+    # Virtual Try-On
+    # =========================================================================
+
+    def tryon(
+        self,
+        person_image_url: str,
+        *,
+        garment_image_url: Optional[str] = None,
+        garment_id: Optional[str] = None,
+        category: str = "tops",
+        garment_photo_type: Optional[str] = None,
+        garments: Optional[list[dict[str, Any]]] = None,
+        num_images: int = 1,
+        seed: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Dress a person photo in a garment.
+
+        Returns immediately with a job_id — a render takes ~11 s, so collect the
+        result with wait_for_tryon() or poll get_tryon_status() yourself.
+
+        Args:
+            person_image_url: Publicly reachable URL of the person photo.
+            garment_image_url: URL of the garment photo. Required unless
+                garment_id or garments is given.
+            garment_id: A catalogue garment. Supplies the image and overrides
+                category and garment_photo_type.
+            category: "tops", "bottoms" or "one-pieces".
+            garment_photo_type: How the garment was shot — "flat-lay", "model" or
+                "auto". Defaults to "flat-lay" server-side.
+            garments: Two garments to apply in one job, e.g.
+                [{"garment_image_url": ..., "category": "tops"},
+                 {"garment_id": ..., "category": "bottoms"}].
+                Exactly one top and one bottom, no one-pieces. Costs 3 credits
+                instead of 4 and forces num_images to 1. Order is irrelevant —
+                the top is always applied first.
+            num_images: Renders to produce, 1-4. Ignored for an outfit.
+            seed: Fixed seed for reproducible output.
+
+        Returns:
+            Dict with job_id, status, category, credits_used, billing,
+            estimated_seconds and poll_url.
+        """
+        payload: dict[str, Any] = {
+            "person_image_url": person_image_url,
+            "num_images": num_images,
+        }
+        # An outfit and a single garment are mutually exclusive request shapes;
+        # sending both would leave the server to guess which was meant.
+        if garments:
+            payload["garments"] = garments
+        else:
+            if garment_image_url is not None:
+                payload["garment_image_url"] = garment_image_url
+            if garment_id is not None:
+                payload["garment_id"] = garment_id
+            payload["category"] = category
+            if garment_photo_type is not None:
+                payload["garment_photo_type"] = garment_photo_type
+        if seed is not None:
+            payload["seed"] = seed
+
+        response = self._request("POST", "/v1/ai/tryon", json_data=payload)
+        return response.json()
+
+    def get_tryon_status(self, job_id: str) -> dict[str, Any]:
+        """Check the status of a try-on job.
+
+        Args:
+            job_id: The job_id returned from tryon().
+
+        Returns:
+            Dict with status, progress, images (when completed) and
+            error_message (when failed).
+        """
+        response = self._request("GET", f"/v1/ai/tryon/{job_id}")
+        return response.json()
+
+    def wait_for_tryon(
+        self,
+        job_id: str,
+        *,
+        poll_interval: float = 3.0,
+        timeout: float = 120.0,
+    ) -> dict[str, Any]:
+        """Wait for a try-on job to complete, polling at intervals.
+
+        A partially failed outfit completes rather than fails: the top-only
+        render comes back and one credit is refunded. Check
+        result["metadata"]["partial_failure"] to detect that — this method
+        treats it as success, because a paid-for render did arrive.
+
+        Args:
+            job_id: The job_id returned from tryon().
+            poll_interval: Seconds between status checks (default: 3.0).
+            timeout: Maximum wait time in seconds (default: 120.0).
+
+        Returns:
+            Dict with the completed job including images.
+
+        Raises:
+            TimeoutError: If the job doesn't complete within timeout.
+            FotoHubError: If the job fails.
+        """
+        start = time.time()
+        while True:
+            if time.time() - start >= timeout:
+                raise TimeoutError(
+                    message=f"Try-on job {job_id} timed out after {timeout}s"
+                )
+
+            result = self.get_tryon_status(job_id)
+            status = result.get("status", "")
+
+            if status == "completed":
+                return result
+            if status in ("failed", "cancelled"):
+                raise FotoHubError(
+                    message=result.get("error_message") or f"Try-on job {job_id} {status}",
+                    status_code=500,
+                    response_body=result,
+                )
+
+            time.sleep(poll_interval)
+
+    # =========================================================================
     # Tier Management
     # =========================================================================
 
@@ -1612,6 +1807,79 @@ class AsyncFotoHub(_BaseClient):
 
         response = await self._request("POST", "/v1/ai/generate/image", json_data=payload)
         return response.json()
+
+    async def generate_ida_q(
+        self,
+        prompt: str,
+        *,
+        aspect_ratio: str = "1:1",
+        image_size: str = "1K",
+        num_images: int = 1,
+        seed: Optional[int] = None,
+        poll_interval: float = 3.0,
+        timeout: float = 300.0,
+    ) -> dict[str, Any]:
+        """Generate an image with IDA Q 1.0, FOTOhub's proprietary image model.
+
+        Unlike :meth:`generate_image`, IDA Q 1.0 runs on a self-hosted, single-GPU
+        queue and is asynchronous — generation takes 30 seconds to ~3.5 minutes
+        depending on ``image_size``. This method submits the job and polls until
+        it completes, returning the finished result. Any prompt (including
+        non-English text) is automatically translated and restructured for best
+        results — see the `IDA Q 1.0 docs <https://docs.fotohub.app/api/ida-q>`_.
+
+        Args:
+            prompt: Text description of the desired image. Any language.
+            aspect_ratio: One of "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9".
+            image_size: Resolution tier — "1K" (~30s), "1.5K" (~90s), or "2K" (~3.5min).
+            num_images: Number of images to generate (1-2).
+            seed: Random seed for reproducibility.
+            poll_interval: Seconds to wait between status checks.
+            timeout: Maximum seconds to wait for completion before raising.
+
+        Returns:
+            Dict with ``images`` (list of URLs), ``model``, ``credits_used``.
+
+        Raises:
+            InsufficientCreditsError: If account lacks credits.
+            TimeoutError: If generation doesn't complete within ``timeout``.
+            FotoHubError: If generation fails server-side.
+        """
+        import asyncio
+
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "model": "ida-q-image",
+            "aspect_ratio": aspect_ratio,
+            "image_size": image_size,
+            "num_images": num_images,
+        }
+        if seed is not None:
+            payload["seed"] = seed
+
+        submit_response = await self._request("POST", "/v1/ai/generate/image", json_data=payload)
+        job = submit_response.json()
+        job_id = job["job_id"]
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            status_response = await self._request("GET", f"/v1/ai/generate/image/ida-q/{job_id}")
+            status = status_response.json()
+            if status["status"] == "completed":
+                return {
+                    "model": "ida-q-image",
+                    "job_id": job_id,
+                    "credits_used": job.get("credits_used"),
+                    "billing": job.get("billing"),
+                    "images": status.get("images", []),
+                    "metadata": status.get("metadata"),
+                }
+            if status["status"] == "failed":
+                raise FotoHubError(status.get("error", "IDA Q 1.0 generation failed"))
+            await asyncio.sleep(poll_interval)
+
+        raise TimeoutError(message=f"IDA Q 1.0 job {job_id} did not complete within {timeout}s")
 
     async def edit_image(
         self,
@@ -2387,6 +2655,81 @@ class AsyncFotoHub(_BaseClient):
         response = await self._request("GET", "/v1/ai/generate/3d/models")
         data = response.json()
         return data.get("models", data) if isinstance(data, dict) else data
+
+    # =========================================================================
+    # Virtual Try-On
+    # =========================================================================
+
+    async def tryon(
+        self,
+        person_image_url: str,
+        *,
+        garment_image_url: Optional[str] = None,
+        garment_id: Optional[str] = None,
+        category: str = "tops",
+        garment_photo_type: Optional[str] = None,
+        garments: Optional[list[dict[str, Any]]] = None,
+        num_images: int = 1,
+        seed: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Dress a person photo in a garment. Pass `garments` (one top plus one
+        bottom) for a chained outfit at 3 credits."""
+        payload: dict[str, Any] = {
+            "person_image_url": person_image_url,
+            "num_images": num_images,
+        }
+        if garments:
+            payload["garments"] = garments
+        else:
+            if garment_image_url is not None:
+                payload["garment_image_url"] = garment_image_url
+            if garment_id is not None:
+                payload["garment_id"] = garment_id
+            payload["category"] = category
+            if garment_photo_type is not None:
+                payload["garment_photo_type"] = garment_photo_type
+        if seed is not None:
+            payload["seed"] = seed
+
+        response = await self._request("POST", "/v1/ai/tryon", json_data=payload)
+        return response.json()
+
+    async def get_tryon_status(self, job_id: str) -> dict[str, Any]:
+        """Check the status of a try-on job."""
+        response = await self._request("GET", f"/v1/ai/tryon/{job_id}")
+        return response.json()
+
+    async def wait_for_tryon(
+        self,
+        job_id: str,
+        *,
+        poll_interval: float = 3.0,
+        timeout: float = 120.0,
+    ) -> dict[str, Any]:
+        """Wait for a try-on job to complete. A partially failed outfit counts as
+        success — inspect result["metadata"]["partial_failure"]."""
+        import asyncio
+
+        start = time.time()
+        while True:
+            if time.time() - start >= timeout:
+                raise TimeoutError(
+                    message=f"Try-on job {job_id} timed out after {timeout}s"
+                )
+
+            result = await self.get_tryon_status(job_id)
+            status = result.get("status", "")
+
+            if status == "completed":
+                return result
+            if status in ("failed", "cancelled"):
+                raise FotoHubError(
+                    message=result.get("error_message") or f"Try-on job {job_id} {status}",
+                    status_code=500,
+                    response_body=result,
+                )
+
+            await asyncio.sleep(poll_interval)
 
     # =========================================================================
     # Tier Management
