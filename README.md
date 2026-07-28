@@ -30,7 +30,7 @@
 - **Chat / LLM** — OpenAI-compatible chat completions with streaming support
 - **Gabriel AI** — Intent orchestration engine for natural-language workflows
 - **Storage** — S3 bucket provisioning with presigned upload/download URLs
-- **Translation** — Multi-language translation (no auth required)
+- **Translation** — Multi-language translation
 - **Fully Typed** — Complete type annotations with Pydantic v2 models
 - **Sync + Async** — Both synchronous and asynchronous clients included
 - **Automatic Retries** — Exponential backoff with configurable retry logic
@@ -286,12 +286,12 @@ download = client.presign_download(bucket_id="bucket-123", key="images/photo.jpg
 print(f"Download: {download.url}")
 ```
 
-### Translation (No Auth Required)
+### Translation
 
 ```python
 from fotohub import FotoHub
 
-client = FotoHub()  # No API key needed
+client = FotoHub(api_key="fh_live_...")
 
 result = client.translate(text="Hello, how are you?", target_language="pl")
 print(result.translated_text)   # "Cześć, jak się masz?"
