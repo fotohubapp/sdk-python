@@ -5,6 +5,7 @@ Covers all 29+ public API endpoints with full type annotations.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import warnings
@@ -28,13 +29,91 @@ DEFAULT_TIMEOUT = 120.0
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_IMAGE_MODEL = "seedream-5-0-260128"
 DEFAULT_VIDEO_MODEL = "veo-2"
+#: Seedance is the one video family that runs asynchronously (202 + job_id), so
+#: it has its own method rather than being reachable through generate_video().
+DEFAULT_SEEDANCE_MODEL = "seedance-2-5"
 DEFAULT_CHAT_MODEL = "gemini-flash"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4.6"
 # Backwards-compat alias — prefer DEFAULT_CLAUDE_MODEL.
 DEFAULT_BEDROCK_MODEL = DEFAULT_CLAUDE_MODEL
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
-SDK_VERSION = "1.7.0"
+SDK_VERSION = "1.8.0"
+
+
+def _extract_error(body: Any, fallback: str) -> tuple[str, dict[str, Any]]:
+    """Pull a human message and any structured fields out of an error body.
+
+    The API is FastAPI, so every error is ``{"detail": ...}`` — either a plain
+    string or, on a few endpoints, a dict. Reading only ``error``/``message``
+    (as this SDK used to) meant the raw JSON was stringified into the message
+    and ``credits_required`` / ``credits_available`` / ``errors`` always came
+    back ``None``. The ``error``/``message`` keys are still honoured so a
+    gateway or Cloudflare error page keeps working.
+
+    Returns the message plus the dict the structured fields should be read
+    from, which is the ``detail`` dict when there is one, else the whole body.
+    """
+    if not isinstance(body, dict):
+        return (str(body) if body else fallback), {}
+
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        message = (
+            detail.get("message")
+            or detail.get("error")
+            or detail.get("detail")
+            or fallback
+        )
+        return str(message), detail
+    if isinstance(detail, list):
+        # FastAPI request-validation errors: [{"loc": [...], "msg": ..., ...}]
+        msgs = [
+            str(d.get("msg")) for d in detail if isinstance(d, dict) and d.get("msg")
+        ]
+        return ("; ".join(msgs) if msgs else fallback), body
+    if detail:
+        return str(detail), body
+
+    message = body.get("error", body.get("message", fallback))
+    if isinstance(message, dict):
+        # {"error": {"message": ...}} — an upstream provider envelope.
+        return str(message.get("message") or message.get("code") or fallback), message
+    return str(message), body
+
+
+def _seedance_payload(**kwargs: Any) -> dict[str, Any]:
+    """Build a /v1/ai/generate/video body for the Seedance family.
+
+    Shared by the sync and async clients so the two cannot drift. Optional
+    fields are omitted rather than sent as null: the API validates the shape of
+    what it receives, and an explicit ``"reference_videos": null`` reads as an
+    empty reference list, which changes the inferred task type.
+    """
+    payload: dict[str, Any] = {
+        "prompt": kwargs["prompt"],
+        "model": kwargs["model"],
+        "duration": kwargs["duration"],
+        "resolution": kwargs["resolution"],
+        "aspect_ratio": kwargs["aspect_ratio"],
+        "generate_audio": kwargs["generate_audio"],
+    }
+    for key in (
+        "image_url", "last_frame_url", "reference_images", "reference_videos",
+        "reference_audios", "asset_ids", "output_format", "negative_prompt",
+        "seed", "callback_url",
+    ):
+        value = kwargs.get(key)
+        if value is not None:
+            payload[key] = value
+    # Booleans are only sent when true — `smart_ratio: false` is the default and
+    # sending it would still be honoured, but it makes request logs read as if
+    # the caller had opted out of something.
+    if kwargs.get("smart_ratio"):
+        payload["smart_ratio"] = True
+    if kwargs.get("smart_duration"):
+        payload["smart_duration"] = True
+    return payload
 
 
 class _BaseClient:
@@ -74,37 +153,37 @@ class _BaseClient:
         except Exception:
             body = {"error": response.text}
 
-        message = body.get("error", body.get("message", response.text))
+        message, fields = _extract_error(body, response.text)
 
         if status == 401 or status == 403:
-            raise AuthError(message=str(message), status_code=status, response_body=body)
+            raise AuthError(message=message, status_code=status, response_body=body)
         elif status == 402:
             raise InsufficientCreditsError(
-                message=str(message),
+                message=message,
                 status_code=status,
                 response_body=body,
-                credits_required=body.get("credits_required"),
-                credits_available=body.get("credits_available"),
+                credits_required=fields.get("credits_required"),
+                credits_available=fields.get("credits_available"),
             )
         elif status == 429:
-            retry_after = response.headers.get("retry-after")
+            retry_after = response.headers.get("retry-after") or fields.get("retry_after")
             raise RateLimitError(
-                message=str(message),
+                message=message,
                 status_code=status,
                 response_body=body,
                 retry_after=float(retry_after) if retry_after else None,
             )
         elif status == 400 or status == 422:
             raise ValidationError(
-                message=str(message),
+                message=message,
                 status_code=status,
                 response_body=body,
-                errors=body.get("errors"),
+                errors=fields.get("errors") or (body.get("detail") if isinstance(body.get("detail"), list) else None),
             )
         elif status >= 500:
-            raise ServerError(message=str(message), status_code=status, response_body=body)
+            raise ServerError(message=message, status_code=status, response_body=body)
         else:
-            raise FotoHubError(message=str(message), status_code=status, response_body=body)
+            raise FotoHubError(message=message, status_code=status, response_body=body)
 
     def _should_retry(self, status_code: int) -> bool:
         """Determine if a request should be retried based on status code."""
@@ -393,6 +472,157 @@ class FotoHub(_BaseClient):
         response = self._request("POST", "/v1/ai/generate/video", json_data=payload)
         return response.json()
 
+    def generate_seedance(
+        self,
+        prompt: str,
+        *,
+        model: str = DEFAULT_SEEDANCE_MODEL,
+        duration: int = 5,
+        resolution: str = "720p",
+        aspect_ratio: str = "16:9",
+        generate_audio: bool = False,
+        image_url: Optional[str] = None,
+        last_frame_url: Optional[str] = None,
+        reference_images: Optional[list[Any]] = None,
+        reference_videos: Optional[list[Any]] = None,
+        reference_audios: Optional[list[Any]] = None,
+        asset_ids: Optional[list[str]] = None,
+        output_format: Optional[str] = None,
+        negative_prompt: Optional[str] = None,
+        seed: Optional[int] = None,
+        callback_url: Optional[str] = None,
+        smart_ratio: bool = False,
+        smart_duration: bool = False,
+        poll_interval: float = 10.0,
+        timeout: float = 1800.0,
+    ) -> dict[str, Any]:
+        """Generate a video with a Seedance model, waiting for the result.
+
+        Unlike :meth:`generate_video`, the Seedance family is asynchronous: the
+        API answers 202 with a ``job_id``, and the render runs in a queue. This
+        method submits, polls, and returns the finished job — so the returned
+        dict already has ``video_url``.
+
+        ``seedance-2-5`` is the only model on the platform that produces a
+        30-second clip in one request, and the only one that accepts a source
+        video (``reference_videos``) for editing or extension. Native audio is
+        included in its price: 14.5 credits/s at 720p, 6.4 at 480p, the same
+        with ``generate_audio`` on or off. It does **not** do 1080p or 4K — those
+        return a 400. For higher resolution use ``seedance-2-0-pro`` (up to 4K,
+        but capped at 15s).
+
+        Args:
+            prompt: Text description of the desired video.
+            model: Seedance model id (default: seedance-2-5). Others:
+                ``seedance-2-0-pro`` / ``-fast`` / ``-mini``,
+                ``seedance-1-5-pro-251215``, ``seedance-1-0-pro-250528``,
+                ``seedance-1-0-pro-fast-251015``.
+            duration: Seconds. 2.5 takes 4-30, 2.0 takes 4-15, 1.x takes 5-10.
+                Pass ``-1`` to match a source clip's length (billed at the
+                model's ceiling, since the real length is unknown until the clip
+                is decoded).
+            resolution: ``"480p"`` or ``"720p"`` on 2.5; ``seedance-2-0-pro``
+                also takes ``"1080p"`` and ``"4K"``. Anything the model does not
+                accept is a 400, never a silent downgrade — the price scales
+                with resolution.
+            aspect_ratio: ``16:9``, ``9:16``, ``1:1``, ``4:3``, ``3:4``,
+                ``21:9``, or ``adaptive``.
+            generate_audio: Native soundtrack. Free on 2.5.
+            image_url: First frame (image-to-video).
+            last_frame_url: Final frame.
+            reference_images: Up to 30 on 2.5 (9 on 2.0). URLs or
+                ``{"mimeType": ..., "base64": ...}`` dicts.
+            reference_videos: Up to 10 on 2.5 (3 on 2.0). Attaching one switches
+                the request to reference / editing / extension mode and raises
+                the rate to 17.6 credits/s at 720p, because the source frames
+                bill as input.
+            reference_audios: Up to 10 on 2.5 (3 on 2.0). Requires at least one
+                image or video reference.
+            asset_ids: Pre-registered ``asset://`` portrait ids from
+                ``POST /v1/ai/assets/register``, for face consistency.
+            output_format: ``"mp4"`` (default) or ``"mov"``. 2.5 only.
+            negative_prompt: Recorded on the job.
+            seed: Recorded on the job.
+            callback_url: HTTPS URL POSTed once the job reaches a terminal state.
+            smart_ratio: Let the model pick the aspect ratio.
+            smart_duration: Let the model pick the duration.
+            poll_interval: Seconds between status checks.
+            timeout: Maximum seconds to wait before raising. A 30s 720p render
+                takes ~4 minutes; the default allows for a queue.
+
+        Returns:
+            The finished job dict — ``video_url``, ``thumbnail_url``, ``status``,
+            ``credits_used``, ``duration``, ``resolution``, ``task_type``,
+            ``billing``.
+
+        Raises:
+            InsufficientCreditsError: If the account lacks credits.
+            TimeoutError: If the job does not finish within ``timeout``.
+            FotoHubError: If the render fails (credits are refunded server-side).
+        """
+        payload = _seedance_payload(
+            prompt=prompt, model=model, duration=duration, resolution=resolution,
+            aspect_ratio=aspect_ratio, generate_audio=generate_audio,
+            image_url=image_url, last_frame_url=last_frame_url,
+            reference_images=reference_images, reference_videos=reference_videos,
+            reference_audios=reference_audios, asset_ids=asset_ids,
+            output_format=output_format, negative_prompt=negative_prompt,
+            seed=seed, callback_url=callback_url, smart_ratio=smart_ratio,
+            smart_duration=smart_duration,
+        )
+
+        submit = self._request(
+            "POST", "/v1/ai/generate/video", json_data=payload
+        ).json()
+        job_id = submit.get("job_id")
+        if not job_id:
+            # A non-Seedance model was passed: that path is synchronous and has
+            # already returned the finished video, so hand it back as-is rather
+            # than polling a job that does not exist.
+            return submit
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = self._request(
+                "GET", f"/v1/ai/generate/video/{job_id}"
+            ).json()
+            state = status.get("status", "")
+            if state == "completed":
+                return status
+            if state in ("failed", "cancelled"):
+                raise FotoHubError(
+                    message=status.get("error")
+                    or status.get("error_message")
+                    or f"Seedance job {job_id} {state}",
+                    status_code=500,
+                    response_body=status,
+                )
+            time.sleep(poll_interval)
+
+        raise TimeoutError(
+            message=f"Seedance job {job_id} did not complete within {timeout}s. "
+                    f"It may still finish — poll GET /v1/ai/generate/video/{job_id}."
+        )
+
+    def register_video_asset(self, image_url: str) -> dict[str, Any]:
+        """Register a hosted portrait as a reusable Seedance asset.
+
+        Free — no credits are charged. Pass the returned ``uri`` (or bare id) in
+        ``asset_ids`` on :meth:`generate_seedance` so the same face appears
+        across generations.
+
+        Args:
+            image_url: HTTPS URL on a FOTOhub host. Upload the file first (e.g.
+                via ``POST /v1/photos/upload``); third-party URLs are refused.
+
+        Returns:
+            Dict with ``asset_id``, ``uri``, ``status``.
+        """
+        response = self._request(
+            "POST", "/v1/ai/assets/register", json_data={"image_url": image_url}
+        )
+        return response.json()
+
     def generate_music(
         self,
         prompt: str,
@@ -531,22 +761,34 @@ class FotoHub(_BaseClient):
             model: LLM model (default: gemini-flash).
             temperature: Sampling temperature (0-2, default: 0.7).
             max_tokens: Maximum tokens in the response.
-            stream: If True, returns a ChatStream iterator yielding SSE chunks.
+            stream: Not supported -- see Raises.
 
         Returns:
-            Dict with choices, usage if stream=False; ChatStream if stream=True.
+            Dict with choices, usage.
+
+        Raises:
+            ValueError: If ``stream=True``. /v1/ai/chat/completions accepts the
+                flag for OpenAI compatibility and then ignores it, returning one
+                complete JSON body. ChatStream finds no SSE frames in that body,
+                so it yields zero chunks and raises nothing -- an empty result
+                for a request that was still billed. Failing before the call
+                keeps it free.
         """
+        if stream:
+            raise ValueError(
+                "chat(stream=True) is not supported: /v1/ai/chat/completions never "
+                "streams, so the iterator would yield nothing while the request is "
+                "still billed. Use POST /v1/ai/agent/stream for token-by-token "
+                "output -- see https://docs.fotohub.app/guides/streaming"
+            )
+
         payload: dict[str, Any] = {
             "messages": messages,
             "model": model,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "stream": stream,
+            "stream": False,
         }
-
-        if stream:
-            response = self._request("POST", "/v1/ai/chat/completions", json_data=payload, stream=True)
-            return ChatStream(response)
 
         response = self._request("POST", "/v1/ai/chat/completions", json_data=payload)
         return response.json()
@@ -880,7 +1122,9 @@ class FotoHub(_BaseClient):
         """Get current credit balance and plan info.
 
         Returns:
-            Dict with credits_remaining, plan, limits, usage_this_period.
+            Dict with tier, credits (4h/period counters), wallet
+            (``balance`` in USD, ``currency``), overage
+            (``hard_limit_usd``), and api_subscription.
         """
         response = self._request("GET", "/v1/billing/balance")
         return response.json()
@@ -914,20 +1158,21 @@ class FotoHub(_BaseClient):
 
     def set_overage_limit(
         self,
-        hard_limit_pln: float,
+        hard_limit_usd: float,
         *,
         project_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Set the hard spending limit for overage charges.
 
         Args:
-            hard_limit_pln: Maximum overage amount in PLN.
+            hard_limit_usd: Maximum monthly overage amount in USD. Pass 0 to
+                disable (the wallet balance then becomes the only cap).
             project_id: Optional project ID (defaults to account-level).
 
         Returns:
-            Dict confirming the updated limit.
+            Dict confirming the updated limit (``hard_limit_usd``).
         """
-        payload: dict[str, Any] = {"hard_limit_pln": hard_limit_pln}
+        payload: dict[str, Any] = {"hard_limit_usd": hard_limit_usd}
         if project_id is not None:
             payload["project_id"] = project_id
 
@@ -938,7 +1183,8 @@ class FotoHub(_BaseClient):
         """Get available credit top-up packages.
 
         Returns:
-            List of packages with id, credits, price_pln, bonus.
+            List of packages with slug, name, amount_usd, bonus_credits,
+            bonus_pct.
         """
         response = self._request("GET", "/v1/billing/topup/packages")
         data = response.json()
@@ -991,7 +1237,8 @@ class FotoHub(_BaseClient):
                 and relevant parameters (width, height, duration, etc.).
 
         Returns:
-            Dict with total_credits, breakdown per operation.
+            Dict with total_credits, total_usd, currency, and a breakdown
+            per operation (each with credits and price_usd).
         """
         payload: dict[str, Any] = {"operations": operations}
 
@@ -1296,16 +1543,27 @@ class FotoHub(_BaseClient):
         response = self._request("GET", "/v1/tiers/wallet")
         return response.json()
 
-    def topup_wallet(self, amount: float) -> dict[str, Any]:
-        """Top up wallet balance (returns payment session URL).
+    def topup_wallet(
+        self,
+        amount_usd: float,
+        *,
+        pay_currency: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Top up wallet balance (returns a Stripe checkout URL).
 
         Args:
-            amount: Amount in PLN to add.
+            amount_usd: Amount in USD to add (minimum 10, maximum 15000).
+            pay_currency: Optional Stripe charge currency, ``"usd"`` (default)
+                or ``"pln"``. With ``"pln"`` a Polish customer pays by
+                BLIK/card/bank transfer while the wallet is still credited
+                ``amount_usd``.
 
         Returns:
-            Dict with session_url for completing payment.
+            Dict with checkout_url, amount_usd, pay_currency, bonus_credits.
         """
-        payload: dict[str, Any] = {"amount": amount}
+        payload: dict[str, Any] = {"amount_usd": amount_usd}
+        if pay_currency is not None:
+            payload["pay_currency"] = pay_currency
         response = self._request("POST", "/v1/tiers/wallet/topup", json_data=payload)
         return response.json()
 
@@ -1959,6 +2217,110 @@ class AsyncFotoHub(_BaseClient):
         response = await self._request("POST", "/v1/ai/generate/video", json_data=payload)
         return response.json()
 
+    async def generate_seedance(
+        self,
+        prompt: str,
+        *,
+        model: str = DEFAULT_SEEDANCE_MODEL,
+        duration: int = 5,
+        resolution: str = "720p",
+        aspect_ratio: str = "16:9",
+        generate_audio: bool = False,
+        image_url: Optional[str] = None,
+        last_frame_url: Optional[str] = None,
+        reference_images: Optional[list[Any]] = None,
+        reference_videos: Optional[list[Any]] = None,
+        reference_audios: Optional[list[Any]] = None,
+        asset_ids: Optional[list[str]] = None,
+        output_format: Optional[str] = None,
+        negative_prompt: Optional[str] = None,
+        seed: Optional[int] = None,
+        callback_url: Optional[str] = None,
+        smart_ratio: bool = False,
+        smart_duration: bool = False,
+        poll_interval: float = 10.0,
+        timeout: float = 1800.0,
+    ) -> dict[str, Any]:
+        """Generate a video with a Seedance model, waiting for the result.
+
+        Async counterpart of :meth:`FotoHub.generate_seedance` — same parameters,
+        same return shape. ``seedance-2-5`` is the only model that reaches 30
+        seconds in a single request (4-30s, 480p/720p, audio included at
+        14.5 credits/s at 720p) and the only one that accepts a source video.
+
+        Returns:
+            The finished job dict — ``video_url``, ``thumbnail_url``, ``status``,
+            ``credits_used``, ``duration``, ``resolution``, ``task_type``,
+            ``billing``.
+
+        Raises:
+            InsufficientCreditsError: If the account lacks credits.
+            TimeoutError: If the job does not finish within ``timeout``.
+            FotoHubError: If the render fails (credits are refunded server-side).
+        """
+        payload = _seedance_payload(
+            prompt=prompt, model=model, duration=duration, resolution=resolution,
+            aspect_ratio=aspect_ratio, generate_audio=generate_audio,
+            image_url=image_url, last_frame_url=last_frame_url,
+            reference_images=reference_images, reference_videos=reference_videos,
+            reference_audios=reference_audios, asset_ids=asset_ids,
+            output_format=output_format, negative_prompt=negative_prompt,
+            seed=seed, callback_url=callback_url, smart_ratio=smart_ratio,
+            smart_duration=smart_duration,
+        )
+
+        submit_response = await self._request(
+            "POST", "/v1/ai/generate/video", json_data=payload
+        )
+        submit = submit_response.json()
+        job_id = submit.get("job_id")
+        if not job_id:
+            # Non-Seedance model — that path is synchronous and already finished.
+            return submit
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status_response = await self._request(
+                "GET", f"/v1/ai/generate/video/{job_id}"
+            )
+            status = status_response.json()
+            state = status.get("status", "")
+            if state == "completed":
+                return status
+            if state in ("failed", "cancelled"):
+                raise FotoHubError(
+                    message=status.get("error")
+                    or status.get("error_message")
+                    or f"Seedance job {job_id} {state}",
+                    status_code=500,
+                    response_body=status,
+                )
+            await asyncio.sleep(poll_interval)
+
+        raise TimeoutError(
+            message=f"Seedance job {job_id} did not complete within {timeout}s. "
+                    f"It may still finish — poll GET /v1/ai/generate/video/{job_id}."
+        )
+
+    async def register_video_asset(self, image_url: str) -> dict[str, Any]:
+        """Register a hosted portrait as a reusable Seedance asset.
+
+        Free — no credits are charged. Pass the returned ``uri`` (or bare id) in
+        ``asset_ids`` on :meth:`generate_seedance` so the same face appears
+        across generations.
+
+        Args:
+            image_url: HTTPS URL on a FOTOhub host. Upload the file first;
+                third-party URLs are refused.
+
+        Returns:
+            Dict with ``asset_id``, ``uri``, ``status``.
+        """
+        response = await self._request(
+            "POST", "/v1/ai/assets/register", json_data={"image_url": image_url}
+        )
+        return response.json()
+
     async def generate_music(
         self,
         prompt: str,
@@ -2097,24 +2459,34 @@ class AsyncFotoHub(_BaseClient):
             model: LLM model (default: gemini-flash).
             temperature: Sampling temperature (0-2, default: 0.7).
             max_tokens: Maximum tokens in the response.
-            stream: If True, returns an AsyncChatStream iterator yielding SSE chunks.
+            stream: Not supported -- see Raises.
 
         Returns:
-            Dict with choices, usage if stream=False; AsyncChatStream if stream=True.
+            Dict with choices, usage.
+
+        Raises:
+            ValueError: If ``stream=True``. /v1/ai/chat/completions accepts the
+                flag for OpenAI compatibility and then ignores it, returning one
+                complete JSON body. AsyncChatStream finds no SSE frames in that
+                body, so it yields zero chunks and raises nothing -- an empty
+                result for a request that was still billed. Failing before the
+                call keeps it free.
         """
+        if stream:
+            raise ValueError(
+                "chat(stream=True) is not supported: /v1/ai/chat/completions never "
+                "streams, so the iterator would yield nothing while the request is "
+                "still billed. Use POST /v1/ai/agent/stream for token-by-token "
+                "output -- see https://docs.fotohub.app/guides/streaming"
+            )
+
         payload: dict[str, Any] = {
             "messages": messages,
             "model": model,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "stream": stream,
+            "stream": False,
         }
-
-        if stream:
-            response = await self._request(
-                "POST", "/v1/ai/chat/completions", json_data=payload, stream=True
-            )
-            return AsyncChatStream(response)
 
         response = await self._request("POST", "/v1/ai/chat/completions", json_data=payload)
         return response.json()
@@ -2452,7 +2824,9 @@ class AsyncFotoHub(_BaseClient):
         """Get current credit balance and plan info.
 
         Returns:
-            Dict with credits_remaining, plan, limits, usage_this_period.
+            Dict with tier, credits (4h/period counters), wallet
+            (``balance`` in USD, ``currency``), overage
+            (``hard_limit_usd``), and api_subscription.
         """
         response = await self._request("GET", "/v1/billing/balance")
         return response.json()
@@ -2486,20 +2860,21 @@ class AsyncFotoHub(_BaseClient):
 
     async def set_overage_limit(
         self,
-        hard_limit_pln: float,
+        hard_limit_usd: float,
         *,
         project_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Set the hard spending limit for overage charges.
 
         Args:
-            hard_limit_pln: Maximum overage amount in PLN.
+            hard_limit_usd: Maximum monthly overage amount in USD. Pass 0 to
+                disable (the wallet balance then becomes the only cap).
             project_id: Optional project ID (defaults to account-level).
 
         Returns:
-            Dict confirming the updated limit.
+            Dict confirming the updated limit (``hard_limit_usd``).
         """
-        payload: dict[str, Any] = {"hard_limit_pln": hard_limit_pln}
+        payload: dict[str, Any] = {"hard_limit_usd": hard_limit_usd}
         if project_id is not None:
             payload["project_id"] = project_id
 
@@ -2512,7 +2887,8 @@ class AsyncFotoHub(_BaseClient):
         """Get available credit top-up packages.
 
         Returns:
-            List of packages with id, credits, price_pln, bonus.
+            List of packages with slug, name, amount_usd, bonus_credits,
+            bonus_pct.
         """
         response = await self._request("GET", "/v1/billing/topup/packages")
         data = response.json()
@@ -2565,7 +2941,8 @@ class AsyncFotoHub(_BaseClient):
                 and relevant parameters (width, height, duration, etc.).
 
         Returns:
-            Dict with total_credits, breakdown per operation.
+            Dict with total_credits, total_usd, currency, and a breakdown
+            per operation (each with credits and price_usd).
         """
         payload: dict[str, Any] = {"operations": operations}
 
@@ -2761,9 +3138,21 @@ class AsyncFotoHub(_BaseClient):
         response = await self._request("GET", "/v1/tiers/wallet")
         return response.json()
 
-    async def topup_wallet(self, amount: float) -> dict[str, Any]:
-        """Top up wallet balance."""
-        payload: dict[str, Any] = {"amount": amount}
+    async def topup_wallet(
+        self,
+        amount_usd: float,
+        *,
+        pay_currency: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Top up wallet balance (returns a Stripe checkout URL).
+
+        ``amount_usd`` is in USD (minimum 10, maximum 15000). Pass
+        ``pay_currency="pln"`` to charge in PLN via BLIK/card/bank while still
+        crediting the wallet ``amount_usd``.
+        """
+        payload: dict[str, Any] = {"amount_usd": amount_usd}
+        if pay_currency is not None:
+            payload["pay_currency"] = pay_currency
         response = await self._request("POST", "/v1/tiers/wallet/topup", json_data=payload)
         return response.json()
 
