@@ -38,7 +38,7 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4.6"
 DEFAULT_BEDROCK_MODEL = DEFAULT_CLAUDE_MODEL
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
-SDK_VERSION = "1.9.0"
+SDK_VERSION = "1.9.1"
 
 
 def _extract_error(body: Any, fallback: str) -> tuple[str, dict[str, Any]]:
@@ -1423,6 +1423,25 @@ class FotoHub(_BaseClient):
             List of 3D models with id, name, credits, speed, mode, quality.
         """
         response = self._request("GET", "/v1/ai/generate/3d/models")
+        data = response.json()
+        return data.get("models", data) if isinstance(data, dict) else data
+
+    def list_models(self, category: Optional[str] = None) -> list[dict[str, Any]]:
+        """List the model catalog with pricing.
+
+        Read `price_unit` -- not `pricing_type` -- to know what `request_price`
+        buys. `pricing_type` says "request" on every video model, but their
+        price is per second of output.
+
+        Args:
+            category: Narrow to one of image, video, audio, text.
+
+        Returns:
+            List of models with id, name, request_price, price_unit,
+            request_price_per, currency and limits.
+        """
+        params = {"category": category} if category else None
+        response = self._request("GET", "/v1/models", params=params)
         data = response.json()
         return data.get("models", data) if isinstance(data, dict) else data
 
@@ -3145,6 +3164,25 @@ class AsyncFotoHub(_BaseClient):
     async def list_3d_models(self) -> list[dict[str, Any]]:
         """List available 3D generation models."""
         response = await self._request("GET", "/v1/ai/generate/3d/models")
+        data = response.json()
+        return data.get("models", data) if isinstance(data, dict) else data
+
+    async def list_models(self, category: Optional[str] = None) -> list[dict[str, Any]]:
+        """List the model catalog with pricing.
+
+        Read `price_unit` -- not `pricing_type` -- to know what `request_price`
+        buys. `pricing_type` says "request" on every video model, but their
+        price is per second of output.
+
+        Args:
+            category: Narrow to one of image, video, audio, text.
+
+        Returns:
+            List of models with id, name, request_price, price_unit,
+            request_price_per, currency and limits.
+        """
+        params = {"category": category} if category else None
+        response = await self._request("GET", "/v1/models", params=params)
         data = response.json()
         return data.get("models", data) if isinstance(data, dict) else data
 
