@@ -38,7 +38,7 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4.6"
 DEFAULT_BEDROCK_MODEL = DEFAULT_CLAUDE_MODEL
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
-SDK_VERSION = "1.8.0"
+SDK_VERSION = "1.9.0"
 
 
 def _extract_error(body: Any, fallback: str) -> tuple[str, dict[str, Any]]:
@@ -286,6 +286,7 @@ class FotoHub(_BaseClient):
         height: int = 1024,
         aspect_ratio: str = "1:1",
         num_images: int = 1,
+        image_size: Optional[str] = None,
         negative_prompt: Optional[str] = None,
         style: Optional[str] = None,
         seed: Optional[int] = None,
@@ -298,7 +299,13 @@ class FotoHub(_BaseClient):
             width: Image width in pixels.
             height: Image height in pixels.
             aspect_ratio: Aspect ratio string (e.g. "1:1", "16:9", "9:16").
-            num_images: Number of images to generate (1-4).
+            num_images: Whole number of images, 1-8. Charged per image the
+                provider actually delivers: every provider caps the count at its
+                own maximum, and the difference is refunded automatically.
+            image_size: Resolution tier -- "1K", "1.5K", "2K", "3K" or "4K".
+                This is priced: 4K costs more than 1K on any model offering it.
+                Leave it None to bill the model's 1K base rate; width/height are
+                mapped onto a tier when it is omitted.
             negative_prompt: Things to avoid in the image.
             style: Style preset (e.g. "photographic", "cinematic", "anime").
             seed: Random seed for reproducibility.
@@ -318,6 +325,8 @@ class FotoHub(_BaseClient):
             "aspect_ratio": aspect_ratio,
             "num_images": num_images,
         }
+        if image_size is not None:
+            payload["image_size"] = image_size
         if negative_prompt is not None:
             payload["negative_prompt"] = negative_prompt
         if style is not None:
@@ -441,12 +450,20 @@ class FotoHub(_BaseClient):
         aspect_ratio: str = "16:9",
         image_url: Optional[str] = None,
         resolution: str = "1080p",
+        poll_interval: float = 5.0,
+        timeout: float = 900.0,
     ) -> dict[str, Any]:
-        """Generate a video (synchronous — blocks until the video is ready).
+        """Generate a video, waiting for the finished file.
 
-        The request holds open until generation finishes, so the returned dict
-        already contains the finished ``video_url``. There is no separate job to
-        poll; :meth:`wait_for_video` is unnecessary.
+        Most models render inside the request and come back finished. Some
+        (Alibaba Wan, xAI Grok) answer immediately with ``status: "processing"``
+        and a ``job_id`` instead — so this polls until the job reaches a terminal
+        state and returns the completed result either way. The returned dict
+        always has ``video_url`` set on success.
+
+        Note that ``duration`` is snapped to a length the provider actually
+        renders (Veo accepts only 4/6/8s, Kling 5/10s), and the charge follows
+        the snapped value — read ``duration`` on the result, not your request.
 
         Args:
             prompt: Text description of the desired video.
@@ -455,9 +472,19 @@ class FotoHub(_BaseClient):
             aspect_ratio: Aspect ratio (e.g. "16:9", "9:16", "1:1").
             image_url: Reference image for image-to-video generation.
             resolution: Output resolution ("720p", "1080p", "4k").
+            poll_interval: Seconds between polls, for the models that queue.
+            timeout: How long to keep polling before giving up. The job itself
+                is unaffected and may still finish.
 
         Returns:
             Dict with model, credits_used, video_url, job_id, status, duration.
+
+        Raises:
+            FotoHubError: If the generation failed. Credits for a failed video
+                are refunded automatically, so a raise here does not mean you
+                paid for nothing delivered.
+            TimeoutError: If the job was still processing when ``timeout``
+                elapsed.
         """
         payload: dict[str, Any] = {
             "prompt": prompt,
@@ -469,8 +496,43 @@ class FotoHub(_BaseClient):
         if image_url is not None:
             payload["image_url"] = image_url
 
-        response = self._request("POST", "/v1/ai/generate/video", json_data=payload)
-        return response.json()
+        result = self._request(
+            "POST", "/v1/ai/generate/video", json_data=payload
+        ).json()
+
+        job_id = result.get("job_id")
+        # Only the queueing models need polling. A finished response already
+        # carries the URL, and one without a job_id cannot be polled at all.
+        if result.get("video_url") or result.get("status") != "processing" or not job_id:
+            return result
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(poll_interval)
+            status = self._request(
+                "GET", f"/v1/ai/generate/video/{job_id}"
+            ).json()
+            state = status.get("status", "")
+            if state == "completed":
+                # The poll route reports job state, not the charge -- only the
+                # submit response carries `credits_used`. Carry it across so it
+                # is not silently absent on exactly the models that queue.
+                if status.get("credits_used") is None:
+                    status["credits_used"] = result.get("credits_used")
+                return status
+            if state in ("failed", "cancelled"):
+                raise FotoHubError(
+                    message=status.get("error")
+                    or status.get("error_message")
+                    or f"Video job {job_id} {state}",
+                    status_code=500,
+                    response_body=status,
+                )
+
+        raise TimeoutError(
+            message=f"Video job {job_id} did not complete within {timeout}s. "
+                    f"It may still finish — poll GET /v1/ai/generate/video/{job_id}."
+        )
 
     def generate_seedance(
         self,
@@ -1892,10 +1954,10 @@ class FotoHub(_BaseClient):
         """Return a finished video result.
 
         .. deprecated:: 1.4.0
-            Video generation is synchronous — :meth:`generate_video` already
-            returns the finished ``video_url``, so there is no job to poll. This
-            method now just returns the result dict from :meth:`generate_video`
-            unchanged, and will be removed in a future release.
+            :meth:`generate_video` already waits for the finished ``video_url``,
+            polling on your behalf for the models that queue (Wan, Grok). This
+            method just returns its result dict unchanged, and will be removed in
+            a future release.
 
         Args:
             result: The dict returned by :meth:`generate_video`.
@@ -1906,17 +1968,17 @@ class FotoHub(_BaseClient):
             The finished video result dict.
         """
         warnings.warn(
-            "wait_for_video() is deprecated; generate_video() is synchronous and "
-            "already returns the finished video_url.",
+            "wait_for_video() is deprecated; generate_video() already returns "
+            "the finished video_url, polling when the model queues.",
             DeprecationWarning,
             stacklevel=2,
         )
         if isinstance(result, dict):
             return result
         raise FotoHubError(
-            "wait_for_video() no longer accepts a job_id: video generation is "
-            "synchronous. Pass the dict returned by generate_video() (or just "
-            "read its 'video_url')."
+            "wait_for_video() no longer accepts a job_id: generate_video() "
+            "polls for you. Pass the dict it returned (or just read its "
+            "'video_url')."
         )
 
     # =========================================================================
@@ -2186,12 +2248,20 @@ class AsyncFotoHub(_BaseClient):
         aspect_ratio: str = "16:9",
         image_url: Optional[str] = None,
         resolution: str = "1080p",
+        poll_interval: float = 5.0,
+        timeout: float = 900.0,
     ) -> dict[str, Any]:
-        """Generate a video (awaits until the video is ready).
+        """Generate a video, awaiting the finished file.
 
-        The request holds open until generation finishes, so the returned dict
-        already contains the finished ``video_url``. There is no separate job to
-        poll; :meth:`wait_for_video` is unnecessary.
+        Most models render inside the request and come back finished. Some
+        (Alibaba Wan, xAI Grok) answer immediately with ``status: "processing"``
+        and a ``job_id`` instead — so this polls until the job reaches a terminal
+        state and returns the completed result either way. The returned dict
+        always has ``video_url`` set on success.
+
+        Note that ``duration`` is snapped to a length the provider actually
+        renders (Veo accepts only 4/6/8s, Kling 5/10s), and the charge follows
+        the snapped value — read ``duration`` on the result, not your request.
 
         Args:
             prompt: Text description of the desired video.
@@ -2200,9 +2270,19 @@ class AsyncFotoHub(_BaseClient):
             aspect_ratio: Aspect ratio (e.g. "16:9", "9:16", "1:1").
             image_url: Reference image for image-to-video generation.
             resolution: Output resolution ("720p", "1080p", "4k").
+            poll_interval: Seconds between polls, for the models that queue.
+            timeout: How long to keep polling before giving up. The job itself
+                is unaffected and may still finish.
 
         Returns:
             Dict with model, credits_used, video_url, job_id, status, duration.
+
+        Raises:
+            FotoHubError: If the generation failed. Credits for a failed video
+                are refunded automatically, so a raise here does not mean you
+                paid for nothing delivered.
+            TimeoutError: If the job was still processing when ``timeout``
+                elapsed.
         """
         payload: dict[str, Any] = {
             "prompt": prompt,
@@ -2215,7 +2295,42 @@ class AsyncFotoHub(_BaseClient):
             payload["image_url"] = image_url
 
         response = await self._request("POST", "/v1/ai/generate/video", json_data=payload)
-        return response.json()
+        result = response.json()
+
+        job_id = result.get("job_id")
+        # Only the queueing models need polling. A finished response already
+        # carries the URL, and one without a job_id cannot be polled at all.
+        if result.get("video_url") or result.get("status") != "processing" or not job_id:
+            return result
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_interval)
+            status_resp = await self._request(
+                "GET", f"/v1/ai/generate/video/{job_id}"
+            )
+            status = status_resp.json()
+            state = status.get("status", "")
+            if state == "completed":
+                # The poll route reports job state, not the charge -- only the
+                # submit response carries `credits_used`. Carry it across so it
+                # is not silently absent on exactly the models that queue.
+                if status.get("credits_used") is None:
+                    status["credits_used"] = result.get("credits_used")
+                return status
+            if state in ("failed", "cancelled"):
+                raise FotoHubError(
+                    message=status.get("error")
+                    or status.get("error_message")
+                    or f"Video job {job_id} {state}",
+                    status_code=500,
+                    response_body=status,
+                )
+
+        raise TimeoutError(
+            message=f"Video job {job_id} did not complete within {timeout}s. "
+                    f"It may still finish — poll GET /v1/ai/generate/video/{job_id}."
+        )
 
     async def generate_seedance(
         self,
@@ -3399,10 +3514,10 @@ class AsyncFotoHub(_BaseClient):
         """Return a finished video result.
 
         .. deprecated:: 1.4.0
-            Video generation is synchronous — :meth:`generate_video` already
-            returns the finished ``video_url``, so there is no job to poll. This
-            method now just returns the result dict from :meth:`generate_video`
-            unchanged, and will be removed in a future release.
+            :meth:`generate_video` already waits for the finished ``video_url``,
+            polling on your behalf for the models that queue (Wan, Grok). This
+            method just returns its result dict unchanged, and will be removed in
+            a future release.
 
         Args:
             result: The dict returned by :meth:`generate_video`.
@@ -3413,17 +3528,17 @@ class AsyncFotoHub(_BaseClient):
             The finished video result dict.
         """
         warnings.warn(
-            "wait_for_video() is deprecated; generate_video() is synchronous and "
-            "already returns the finished video_url.",
+            "wait_for_video() is deprecated; generate_video() already returns "
+            "the finished video_url, polling when the model queues.",
             DeprecationWarning,
             stacklevel=2,
         )
         if isinstance(result, dict):
             return result
         raise FotoHubError(
-            "wait_for_video() no longer accepts a job_id: video generation is "
-            "synchronous. Pass the dict returned by generate_video() (or just "
-            "read its 'video_url')."
+            "wait_for_video() no longer accepts a job_id: generate_video() "
+            "polls for you. Pass the dict it returned (or just read its "
+            "'video_url')."
         )
 
     # =========================================================================
