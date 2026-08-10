@@ -820,13 +820,20 @@ class FotoHub(_BaseClient):
 
         Args:
             messages: List of message dicts with ``role`` and ``content``.
-            model: LLM model (default: gemini-flash).
+            model: LLM model (default: gemini-flash). Only ``gemini-flash``,
+                ``gemini-pro``, ``gpt-4o`` and ``claude-sonnet`` are accepted;
+                anything else is rejected with 400 rather than silently
+                substituted.
             temperature: Sampling temperature (0-2, default: 0.7).
             max_tokens: Maximum tokens in the response.
             stream: Not supported -- see Raises.
 
         Returns:
-            Dict with choices, usage.
+            Dict with choices, usage and billing. Billed on real token counts,
+            so ``billing["credits_used"]`` is fractional and scales with the
+            length of the answer -- about 0.02 for a short reply, not 1.
+            ``billing["basis"]`` is ``"tokens"`` when the charge came from the
+            model's own usage figures.
 
         Raises:
             ValueError: If ``stream=True``. /v1/ai/chat/completions accepts the
@@ -2590,13 +2597,20 @@ class AsyncFotoHub(_BaseClient):
 
         Args:
             messages: List of message dicts with ``role`` and ``content``.
-            model: LLM model (default: gemini-flash).
+            model: LLM model (default: gemini-flash). Only ``gemini-flash``,
+                ``gemini-pro``, ``gpt-4o`` and ``claude-sonnet`` are accepted;
+                anything else is rejected with 400 rather than silently
+                substituted.
             temperature: Sampling temperature (0-2, default: 0.7).
             max_tokens: Maximum tokens in the response.
             stream: Not supported -- see Raises.
 
         Returns:
-            Dict with choices, usage.
+            Dict with choices, usage and billing. Billed on real token counts,
+            so ``billing["credits_used"]`` is fractional and scales with the
+            length of the answer -- about 0.02 for a short reply, not 1.
+            ``billing["basis"]`` is ``"tokens"`` when the charge came from the
+            model's own usage figures.
 
         Raises:
             ValueError: If ``stream=True``. /v1/ai/chat/completions accepts the
