@@ -38,7 +38,7 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4.6"
 DEFAULT_BEDROCK_MODEL = DEFAULT_CLAUDE_MODEL
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
-SDK_VERSION = "1.9.1"
+SDK_VERSION = "1.9.2"
 
 
 def _extract_error(body: Any, fallback: str) -> tuple[str, dict[str, Any]]:
@@ -928,20 +928,49 @@ class FotoHub(_BaseClient):
         image_url: str,
         *,
         features: Optional[list[str]] = None,
+        language: Optional[str] = None,
+        max_labels: Optional[int] = None,
+        min_confidence: Optional[float] = None,
     ) -> dict[str, Any]:
         """Analyze an image using vision models.
 
+        Costs a flat 1 credit however many features are requested, so asking for
+        everything in one call is cheaper than one call per feature.
+
         Args:
-            image_url: URL of the image to analyze.
-            features: List of analysis features (e.g. ["caption", "objects",
-                "text", "faces", "nsfw", "colors"]).
+            image_url: URL of the image to analyze. Must be publicly reachable,
+                max 20MB.
+            features: Analysis features to run. Defaults to
+                ``["labels", "objects"]``. Valid: ``labels``, ``objects``,
+                ``faces``, ``nsfw``, ``colors``, ``ocr``, ``landmarks``,
+                ``logos`` (plus the aliases ``text`` for ocr and
+                ``safe_search`` for nsfw). An unrecognised name is rejected
+                with 400 rather than ignored.
+            language: Language hint for OCR. Label names are always English.
+            max_labels: Cap on returned labels, 1-50 (default 50).
+            min_confidence: Minimum confidence 0-1, applied to labels, objects
+                and faces. ``nsfw`` and ``ocr`` carry no numeric score.
 
         Returns:
-            Dict with analysis results keyed by feature.
+            Dict with the requested features at the top level (``labels``,
+            ``objects``, ``faces``, ``nsfw``, ``ocr``, ``colors``, ...) plus
+            ``auto_tags`` -- the flat deduplicated tag list. There is no
+            ``analysis`` wrapper key.
+
+            Faces and content safety return likelihood buckets
+            (``VERY_UNLIKELY`` .. ``VERY_LIKELY``), not floats, and no age or
+            gender. Bounding boxes carry ``units``: ``"pixels"`` for faces and
+            OCR, ``"normalized"`` (0-1 fractions) for objects.
         """
         payload: dict[str, Any] = {"image_url": image_url}
         if features is not None:
             payload["features"] = features
+        if language is not None:
+            payload["language"] = language
+        if max_labels is not None:
+            payload["max_labels"] = max_labels
+        if min_confidence is not None:
+            payload["min_confidence"] = min_confidence
 
         response = self._request("POST", "/v1/ai/analyze/image", json_data=payload)
         return response.json()
@@ -2705,20 +2734,49 @@ class AsyncFotoHub(_BaseClient):
         image_url: str,
         *,
         features: Optional[list[str]] = None,
+        language: Optional[str] = None,
+        max_labels: Optional[int] = None,
+        min_confidence: Optional[float] = None,
     ) -> dict[str, Any]:
         """Analyze an image using vision models.
 
+        Costs a flat 1 credit however many features are requested, so asking for
+        everything in one call is cheaper than one call per feature.
+
         Args:
-            image_url: URL of the image to analyze.
-            features: List of analysis features (e.g. ["caption", "objects",
-                "text", "faces", "nsfw", "colors"]).
+            image_url: URL of the image to analyze. Must be publicly reachable,
+                max 20MB.
+            features: Analysis features to run. Defaults to
+                ``["labels", "objects"]``. Valid: ``labels``, ``objects``,
+                ``faces``, ``nsfw``, ``colors``, ``ocr``, ``landmarks``,
+                ``logos`` (plus the aliases ``text`` for ocr and
+                ``safe_search`` for nsfw). An unrecognised name is rejected
+                with 400 rather than ignored.
+            language: Language hint for OCR. Label names are always English.
+            max_labels: Cap on returned labels, 1-50 (default 50).
+            min_confidence: Minimum confidence 0-1, applied to labels, objects
+                and faces. ``nsfw`` and ``ocr`` carry no numeric score.
 
         Returns:
-            Dict with analysis results keyed by feature.
+            Dict with the requested features at the top level (``labels``,
+            ``objects``, ``faces``, ``nsfw``, ``ocr``, ``colors``, ...) plus
+            ``auto_tags`` -- the flat deduplicated tag list. There is no
+            ``analysis`` wrapper key.
+
+            Faces and content safety return likelihood buckets
+            (``VERY_UNLIKELY`` .. ``VERY_LIKELY``), not floats, and no age or
+            gender. Bounding boxes carry ``units``: ``"pixels"`` for faces and
+            OCR, ``"normalized"`` (0-1 fractions) for objects.
         """
         payload: dict[str, Any] = {"image_url": image_url}
         if features is not None:
             payload["features"] = features
+        if language is not None:
+            payload["language"] = language
+        if max_labels is not None:
+            payload["max_labels"] = max_labels
+        if min_confidence is not None:
+            payload["min_confidence"] = min_confidence
 
         response = await self._request("POST", "/v1/ai/analyze/image", json_data=payload)
         return response.json()
