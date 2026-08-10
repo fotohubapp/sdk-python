@@ -603,6 +603,54 @@ The SDK automatically retries on transient failures:
 
 Backoff schedule: `0.5s → 1s → 2s → 4s → ...` (capped at 30s).
 
+### Idempotency — retries do not double-charge
+
+Retrying a call that spends credits is only safe if the server can tell the
+retry apart from a new request. The dangerous case is a `504` or a timeout that
+arrives *after* the generation already started: the work is running and will be
+billed, but the client sees a failure.
+
+Since **1.10.0** the SDK sends an `X-Idempotency-Key` on every request that can
+charge you, and every retry of one call reuses that same key. The API replays
+the original result instead of running the operation again, so a call that
+retried three times is still charged once. Nothing to configure.
+
+```python
+# All three attempts inside this call share one idempotency key.
+result = client.generate_image(prompt="Product photo")
+```
+
+Two separate calls always get two different keys, even with identical
+arguments — asking twice means you want two generations, and collapsing them
+would lose one you paid for.
+
+That scoping is deliberate, and it is also the limit of what the SDK can do for
+you: it protects the retries *inside* one call. If you need de-duplication
+across process restarts — a job queue that may redeliver the same work after a
+crash — the SDK cannot know two runs are the same job, so call the endpoint over
+HTTP with your own stable key (derive it from the job id):
+
+```python
+import os
+import requests
+
+requests.post(
+    "https://apis.fotohub.app/v1/ai/generate/image",
+    headers={
+        "Authorization": f"Bearer {os.environ['FOTOHUB_API_KEY']}",
+        "Content-Type": "application/json",
+        "X-Idempotency-Key": f"job-{job_id}",  # stable across restarts
+    },
+    json={"prompt": "Product photo"},
+    timeout=120,
+)
+```
+
+A `409` on a request carrying a key means your own earlier attempt is still in
+flight; the SDK waits and collects its result rather than reporting a failure.
+Streaming endpoints (`chat`, `gabriel`, TTS, story) are excluded, because a
+stream cannot be buffered and replayed.
+
 ## Context Managers
 
 Both clients support context managers for automatic resource cleanup:

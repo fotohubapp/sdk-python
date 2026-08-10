@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import uuid
 import warnings
 from typing import Any, Generator, Optional, Union
 
@@ -38,7 +39,60 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4.6"
 DEFAULT_BEDROCK_MODEL = DEFAULT_CLAUDE_MODEL
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
-SDK_VERSION = "1.9.2"
+SDK_VERSION = "1.10.0"
+
+#: Header the API reads to de-duplicate a retried charged request. The SDK sends
+#: one automatically on every guarded POST — see `_idempotency_key_for`.
+IDEMPOTENCY_HEADER = "X-Idempotency-Key"
+
+#: Path prefixes the API protects with `X-Idempotency-Key`. Mirrors
+#: `_IDEMPOTENT_PREFIXES` in api-server's `main.py`. Sending the header outside
+#: these prefixes is harmless (the server ignores it), but generating a key only
+#: where it does something keeps request logs honest.
+_IDEMPOTENT_PREFIXES: tuple[str, ...] = (
+    "/v1/ai/",
+    "/v1/images/",
+    "/v1/video/",
+    "/v1/shorts/",
+    "/v1/story/",
+    "/v1/3d/",
+    "/v1/generate/",
+    "/v1/voice/",
+)
+
+#: Streaming endpoints, which the server deliberately excludes: a buffered
+#: stream cannot be replayed, and holding one back in full before its first byte
+#: would defeat streaming. Mirrors `_IDEMPOTENCY_EXCLUDE_PREFIXES` server-side.
+_IDEMPOTENCY_EXCLUDE_PREFIXES: tuple[str, ...] = (
+    "/v1/ai/chat",
+    "/v1/ai/agent/stream",
+    "/v1/ai/gabriel",
+    "/v1/ai/tts/",
+    "/v1/story/generate",
+)
+
+
+def _idempotency_key_for(method: str, path: str, stream: bool) -> Optional[str]:
+    """A fresh key for one logical call, or None if the call is not guarded.
+
+    Generated per `_request` invocation, NOT per HTTP attempt: that is the whole
+    point. This client retries `(429, 500, 502, 503, 504)` and connect timeouts
+    up to `max_retries` times by default, and a 504 arriving after a render has
+    already started used to bill the same job again on each retry. Reusing one
+    key across the attempts of a single call turns those retries into replays.
+
+    A key is deliberately not carried across separate calls to `_request`: two
+    calls with the same arguments are two requests the caller asked for, and
+    silently collapsing them would make the SDK lose a generation somebody paid
+    for.
+    """
+    if method.upper() not in ("POST", "PUT", "PATCH") or stream:
+        return None
+    if not path.startswith(_IDEMPOTENT_PREFIXES):
+        return None
+    if path.startswith(_IDEMPOTENCY_EXCLUDE_PREFIXES):
+        return None
+    return str(uuid.uuid4())
 
 
 def _extract_error(body: Any, fallback: str) -> tuple[str, dict[str, Any]]:
@@ -185,8 +239,18 @@ class _BaseClient:
         else:
             raise FotoHubError(message=message, status_code=status, response_body=body)
 
-    def _should_retry(self, status_code: int) -> bool:
-        """Determine if a request should be retried based on status code."""
+    def _should_retry(self, status_code: int, *, idempotent: bool = False) -> bool:
+        """Determine if a request should be retried based on status code.
+
+        `idempotent` adds 409 to the retryable set. On a guarded endpoint the
+        API answers 409 with `Retry-After` when a request carrying this same key
+        is still in flight — which, on a retry, is our own earlier attempt. The
+        right move is to wait and collect its result, not to surface the 409 as
+        a failure. Without an idempotency key a 409 means something else
+        entirely (a genuine conflict) and must not be retried.
+        """
+        if idempotent and status_code == 409:
+            return True
         return status_code in (429, 500, 502, 503, 504)
 
     def _backoff_delay(self, attempt: int) -> float:
@@ -235,8 +299,15 @@ class FotoHub(_BaseClient):
         params: Optional[dict[str, Any]] = None,
         stream: bool = False,
     ) -> httpx.Response:
-        """Make an HTTP request with retry logic."""
+        """Make an HTTP request with retry logic.
+
+        Every retry of a charged POST carries the same `X-Idempotency-Key`, so a
+        timeout or a 5xx that arrives after the work has already started is
+        replayed rather than charged again. See `_idempotency_key_for`.
+        """
         last_exception: Optional[Exception] = None
+        idem_key = _idempotency_key_for(method, path, stream)
+        extra_headers = {IDEMPOTENCY_HEADER: idem_key} if idem_key else None
 
         for attempt in range(self.max_retries):
             try:
@@ -246,13 +317,16 @@ class FotoHub(_BaseClient):
                     ).__enter__()
                 else:
                     response = self._client.request(
-                        method, path, json=json_data, params=params
+                        method, path, json=json_data, params=params,
+                        headers=extra_headers,
                     )
 
                 if response.status_code < 400:
                     return response
 
-                if self._should_retry(response.status_code) and attempt < self.max_retries - 1:
+                if self._should_retry(
+                    response.status_code, idempotent=idem_key is not None
+                ) and attempt < self.max_retries - 1:
                     delay = self._backoff_delay(attempt)
                     retry_after = response.headers.get("retry-after")
                     if retry_after:
@@ -2092,10 +2166,16 @@ class AsyncFotoHub(_BaseClient):
         params: Optional[dict[str, Any]] = None,
         stream: bool = False,
     ) -> httpx.Response:
-        """Make an async HTTP request with retry logic."""
+        """Make an async HTTP request with retry logic.
+
+        Same idempotency contract as the sync client: one key per logical call,
+        reused across that call's retries. See `_idempotency_key_for`.
+        """
         import asyncio
 
         last_exception: Optional[Exception] = None
+        idem_key = _idempotency_key_for(method, path, stream)
+        extra_headers = {IDEMPOTENCY_HEADER: idem_key} if idem_key else None
 
         for attempt in range(self.max_retries):
             try:
@@ -2105,13 +2185,16 @@ class AsyncFotoHub(_BaseClient):
                     ).__aenter__()
                 else:
                     response = await self._client.request(
-                        method, path, json=json_data, params=params
+                        method, path, json=json_data, params=params,
+                        headers=extra_headers,
                     )
 
                 if response.status_code < 400:
                     return response
 
-                if self._should_retry(response.status_code) and attempt < self.max_retries - 1:
+                if self._should_retry(
+                    response.status_code, idempotent=idem_key is not None
+                ) and attempt < self.max_retries - 1:
                     delay = self._backoff_delay(attempt)
                     retry_after = response.headers.get("retry-after")
                     if retry_after:
