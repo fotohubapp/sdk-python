@@ -687,8 +687,8 @@ otherwise identical, with one exception: `gabriel_stream()` is sync-only.
 | `generate_sfx(prompt, *, duration)` | Generate a sound effect |
 | `generate_speech(text, *, voice_id, model, language, speed, pitch)` | Text to speech |
 | `transcribe(audio_url, *, language)` | Speech to text |
-| `generate_3d(mode, model, *, image, prompt, quality, format, options)` | Start a 3D mesh job |
-| `get_3d_status(job_id)` / `wait_for_3d(job_id, ...)` | Poll a 3D job |
+| `generate_3d(mode, model, *, image, prompt, quality, format, options)` | Generate a 3D mesh (synchronous — returns the model) |
+| `get_3d_status(file_id)` | Re-sign the download URL of a stored mesh (free) |
 | `tryon(person_image_url, *, garment_image_url, garment_id, category, garments, ...)` | Start a virtual try-on job |
 | `get_tryon_status(job_id)` / `wait_for_tryon(job_id, ...)` | Poll a try-on job |
 

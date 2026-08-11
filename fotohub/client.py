@@ -740,23 +740,94 @@ class FotoHub(_BaseClient):
                     f"It may still finish — poll GET /v1/ai/generate/video/{job_id}."
         )
 
-    def register_video_asset(self, image_url: str) -> dict[str, Any]:
+    def register_video_asset(
+        self, image_url: str, *, retention_hours: Optional[int] = None
+    ) -> dict[str, Any]:
         """Register a hosted portrait as a reusable Seedance asset.
 
         Free — no credits are charged. Pass the returned ``uri`` (or bare id) in
         ``asset_ids`` on :meth:`generate_seedance` so the same face appears
         across generations.
 
+        A registered face is biometric data. Pass ``retention_hours`` to have it
+        self-delete, at the provider and in our records, once that period
+        elapses — use it to honour a data-minimisation policy instead of relying
+        on remembering to call :meth:`delete_video_asset` yourself.
+
         Args:
             image_url: HTTPS URL on a FOTOhub host. Upload the file first (e.g.
                 via ``POST /v1/photos/upload``); third-party URLs are refused.
+            retention_hours: Optional, 1-8760 (1 year). Omit to keep the face
+                until you delete it — this is opt-in so an existing integration
+                does not silently start losing faces it depends on.
 
         Returns:
-            Dict with ``asset_id``, ``uri``, ``status``.
+            Dict with ``asset_id``, ``uri``, ``status``, ``retention_hours``,
+            ``expires_at``.
+        """
+        payload: dict[str, Any] = {"image_url": image_url}
+        if retention_hours is not None:
+            payload["retention_hours"] = retention_hours
+        response = self._request(
+            "POST", "/v1/ai/assets/register", json_data=payload
+        )
+        return response.json()
+
+    def list_video_assets(
+        self, *, limit: int = 50, offset: int = 0
+    ) -> dict[str, Any]:
+        """List the virtual portrait assets registered by this account.
+
+        Each row includes ``retention_hours``, ``expires_at`` and ``purged_at``
+        so you can tell an active registration from an erased one without a
+        second call.
+
+        Returns:
+            Dict with ``assets`` (list) and ``count``.
         """
         response = self._request(
-            "POST", "/v1/ai/assets/register", json_data={"image_url": image_url}
+            "GET", "/v1/ai/assets",
+            params={"limit": limit, "offset": offset},
         )
+        return response.json()
+
+    def get_video_asset(self, asset_id: str) -> dict[str, Any]:
+        """Get the current provider status of one registered face.
+
+        Args:
+            asset_id: The bare id (not the ``asset://`` uri).
+
+        Raises:
+            FotoHubError: 404 if the asset does not belong to this account.
+        """
+        response = self._request("GET", f"/v1/ai/assets/{asset_id}")
+        return response.json()
+
+    def delete_video_asset(self, asset_id: str) -> dict[str, Any]:
+        """Delete a registered face, at the provider and here.
+
+        Use this to honour an erasure request immediately, rather than waiting
+        on ``retention_hours``. The remote delete happens first; the local
+        record is only marked erased once the provider confirms it — so a
+        successful return means the face is actually gone, not just that
+        deletion was requested.
+
+        Idempotent: calling this on an already-erased asset returns
+        ``{"deleted": True, "already_deleted": True}`` rather than raising.
+
+        Args:
+            asset_id: The bare id (not the ``asset://`` uri).
+
+        Returns:
+            Dict with ``asset_id``, ``deleted``, and either ``reason`` or
+            ``already_deleted``.
+
+        Raises:
+            FotoHubError: 404 if the asset does not belong to this account;
+                502 if the provider delete failed (nothing was recorded as
+                deleted — safe to retry).
+        """
+        response = self._request("DELETE", f"/v1/ai/assets/{asset_id}")
         return response.json()
 
     def generate_music(
@@ -1443,17 +1514,29 @@ class FotoHub(_BaseClient):
     ) -> dict[str, Any]:
         """Generate a 3D model from an image or text prompt.
 
+        Synchronous: this returns the finished model. There is no job queue and
+        nothing to poll -- `fh-pro-3d` can take ~60s, so give the client a long
+        timeout rather than reaching for `wait_for_3d`.
+
+        Charged in USD from the prepaid wallet before the GPU runs. A 402 means
+        insufficient funds and nothing was taken; a failure on our side is
+        refunded automatically.
+
         Args:
             mode: Generation mode — "image-to-3d" or "text-to-3d".
-            model: 3D model to use ("fh-lite-3d", "fh-text-3d", "fh-pro-3d").
+            model: 3D model to use. Only "fh-lite-3d" (image) and "fh-text-3d"
+                (text) are enabled; "fh-pro-3d" validates but will not render.
             image: Base64-encoded image (required for image-to-3d).
             prompt: Text prompt (required for text-to-3d).
-            quality: Output quality — "draft", "standard", "high".
+            quality: Output quality — "draft", "standard", "high". Does not
+                affect the price.
             format: Output file format — "glb", "obj", "stl", "usdz".
             options: Additional options (texture, pbr, simplify, target_polys).
 
         Returns:
-            Dict with id, url, format, status, billing info.
+            Dict with `file_id`, `url` (signed, valid 2h), `stats`, `cost_usd`
+            and `billing`. Note there is no `id`, `status`, `poly_count` or
+            `thumbnail_url` -- those were documented but never returned.
         """
         payload: dict[str, Any] = {
             "mode": mode,
@@ -1472,13 +1555,19 @@ class FotoHub(_BaseClient):
         return response.json()
 
     def get_3d_status(self, job_id: str) -> dict[str, Any]:
-        """Check the status of a 3D generation job.
+        """Fetch a stored 3D asset with a freshly signed download URL.
+
+        Not a status check -- `generate_3d()` is synchronous, so the model is
+        already done when it returns. This exists for the expiry: the `url` from
+        the generate call dies after 2 hours and this mints a new one. Free.
 
         Args:
-            job_id: The generation ID returned from generate_3d().
+            job_id: The `file_id` returned from generate_3d().
 
         Returns:
-            Dict with status, url (if completed), and billing info.
+            Dict with a fresh `url`, plus `model`, `format` and `stats`.
+            `status` is always "completed" -- an unfinished generation is never
+            stored. Raises `NotFoundError` if the id is not yours.
         """
         response = self._request("GET", f"/v1/ai/generate/3d/{job_id}")
         return response.json()
@@ -1490,19 +1579,25 @@ class FotoHub(_BaseClient):
         poll_interval: float = 3.0,
         timeout: float = 120.0,
     ) -> dict[str, Any]:
-        """Wait for a 3D generation job to complete, polling at intervals.
+        """Deprecated -- there is nothing to wait for.
+
+        `generate_3d()` is synchronous and returns the finished model, so this
+        resolves on its first poll: a stored asset always reports "completed".
+        Kept so existing code keeps working. New code should use the
+        `generate_3d()` result directly, or `get_3d_status(file_id)` when it
+        needs a fresh signed URL.
 
         Args:
-            job_id: The generation ID returned from generate_3d().
-            poll_interval: Seconds between status checks (default: 3.0).
-            timeout: Maximum wait time in seconds (default: 120.0).
+            job_id: The `file_id` returned from generate_3d().
+            poll_interval: Seconds between checks. Effectively unused now.
+            timeout: Maximum wait in seconds (default: 120.0).
 
         Returns:
-            Dict with completed result including url and billing.
+            Dict with the stored result including a fresh `url`.
 
         Raises:
-            TimeoutError: If the job doesn't complete within timeout.
-            FotoHubError: If the job fails.
+            TimeoutError: Only if the asset lookup itself keeps failing.
+            FotoHubError: If the stored record reports a failure.
         """
         start = time.time()
         while True:
@@ -1530,7 +1625,9 @@ class FotoHub(_BaseClient):
         """List available 3D generation models with capabilities and pricing.
 
         Returns:
-            List of 3D models with id, name, credits, speed, mode, quality.
+            List of 3D models with id, name, `price_usd`, unit, speed, mode,
+            `available` and quality. There is no `credits` key: the API is
+            prepaid USD, so the catalog quotes dollars.
         """
         response = self._request("GET", "/v1/ai/generate/3d/models")
         data = response.json()
@@ -2555,23 +2652,72 @@ class AsyncFotoHub(_BaseClient):
                     f"It may still finish — poll GET /v1/ai/generate/video/{job_id}."
         )
 
-    async def register_video_asset(self, image_url: str) -> dict[str, Any]:
+    async def register_video_asset(
+        self, image_url: str, *, retention_hours: Optional[int] = None
+    ) -> dict[str, Any]:
         """Register a hosted portrait as a reusable Seedance asset.
 
         Free — no credits are charged. Pass the returned ``uri`` (or bare id) in
         ``asset_ids`` on :meth:`generate_seedance` so the same face appears
         across generations.
 
+        A registered face is biometric data. Pass ``retention_hours`` to have it
+        self-delete, at the provider and in our records, once that period
+        elapses — use it to honour a data-minimisation policy instead of relying
+        on remembering to call :meth:`delete_video_asset` yourself.
+
         Args:
             image_url: HTTPS URL on a FOTOhub host. Upload the file first;
                 third-party URLs are refused.
+            retention_hours: Optional, 1-8760 (1 year). Omit to keep the face
+                until you delete it.
 
         Returns:
-            Dict with ``asset_id``, ``uri``, ``status``.
+            Dict with ``asset_id``, ``uri``, ``status``, ``retention_hours``,
+            ``expires_at``.
+        """
+        payload: dict[str, Any] = {"image_url": image_url}
+        if retention_hours is not None:
+            payload["retention_hours"] = retention_hours
+        response = await self._request(
+            "POST", "/v1/ai/assets/register", json_data=payload
+        )
+        return response.json()
+
+    async def list_video_assets(
+        self, *, limit: int = 50, offset: int = 0
+    ) -> dict[str, Any]:
+        """List the virtual portrait assets registered by this account.
+
+        Returns:
+            Dict with ``assets`` (list) and ``count``.
         """
         response = await self._request(
-            "POST", "/v1/ai/assets/register", json_data={"image_url": image_url}
+            "GET", "/v1/ai/assets",
+            params={"limit": limit, "offset": offset},
         )
+        return response.json()
+
+    async def get_video_asset(self, asset_id: str) -> dict[str, Any]:
+        """Get the current provider status of one registered face.
+
+        Raises:
+            FotoHubError: 404 if the asset does not belong to this account.
+        """
+        response = await self._request("GET", f"/v1/ai/assets/{asset_id}")
+        return response.json()
+
+    async def delete_video_asset(self, asset_id: str) -> dict[str, Any]:
+        """Delete a registered face, at the provider and here.
+
+        Idempotent: calling this on an already-erased asset returns
+        ``{"deleted": True, "already_deleted": True}`` rather than raising.
+
+        Raises:
+            FotoHubError: 404 if the asset does not belong to this account;
+                502 if the provider delete failed (safe to retry).
+        """
+        response = await self._request("DELETE", f"/v1/ai/assets/{asset_id}")
         return response.json()
 
     async def generate_music(
@@ -3262,7 +3408,12 @@ class AsyncFotoHub(_BaseClient):
         format: str = "glb",
         options: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Generate a 3D model from an image or text prompt."""
+        """Generate a 3D model from an image or text prompt.
+
+        Synchronous despite being awaited: the coroutine resolves with the
+        finished model, not a job handle. Charged in USD from the prepaid wallet.
+        See the sync `generate_3d` for the full contract.
+        """
         payload: dict[str, Any] = {
             "mode": mode,
             "model": model,
@@ -3280,7 +3431,10 @@ class AsyncFotoHub(_BaseClient):
         return response.json()
 
     async def get_3d_status(self, job_id: str) -> dict[str, Any]:
-        """Check the status of a 3D generation job."""
+        """Fetch a stored 3D asset with a freshly signed URL. Free.
+
+        Not a status check -- see the sync `get_3d_status`.
+        """
         response = await self._request("GET", f"/v1/ai/generate/3d/{job_id}")
         return response.json()
 
@@ -3291,7 +3445,10 @@ class AsyncFotoHub(_BaseClient):
         poll_interval: float = 3.0,
         timeout: float = 120.0,
     ) -> dict[str, Any]:
-        """Wait for a 3D generation job to complete."""
+        """Deprecated -- generation is synchronous, so this returns immediately.
+
+        See the sync `wait_for_3d`.
+        """
         import asyncio
 
         start = time.time()
@@ -3317,7 +3474,7 @@ class AsyncFotoHub(_BaseClient):
             await asyncio.sleep(poll_interval)
 
     async def list_3d_models(self) -> list[dict[str, Any]]:
-        """List available 3D generation models."""
+        """List available 3D generation models, priced in USD (`price_usd`)."""
         response = await self._request("GET", "/v1/ai/generate/3d/models")
         data = response.json()
         return data.get("models", data) if isinstance(data, dict) else data
