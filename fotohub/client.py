@@ -17,7 +17,7 @@ import httpx
 from .exceptions import (
     AuthError,
     FotoHubError,
-    InsufficientCreditsError,
+    InsufficientFundsError,
     RateLimitError,
     ServerError,
     TimeoutError,
@@ -93,6 +93,26 @@ def _idempotency_key_for(method: str, path: str, stream: bool) -> Optional[str]:
     if path.startswith(_IDEMPOTENCY_EXCLUDE_PREFIXES):
         return None
     return str(uuid.uuid4())
+
+
+def _as_float(value: Any) -> Optional[float]:
+    """A money figure from an error body, or ``None`` if there isn't one.
+
+    Explicitly typed rather than truthy: ``0`` is the commonest balance behind a
+    402 and is the single number worth reporting, so a falsy check would drop
+    exactly the case the caller most needs. Strings are accepted because a
+    gateway may serialize numerics; a bool is not a number here.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _extract_error(body: Any, fallback: str) -> tuple[str, dict[str, Any]]:
@@ -212,12 +232,23 @@ class _BaseClient:
         if status == 401 or status == 403:
             raise AuthError(message=message, status_code=status, response_body=body)
         elif status == 402:
-            raise InsufficientCreditsError(
+            # `fields` is the server's flat funds payload: required_usd,
+            # balance_usd, shortfall_usd, topup_url, charged, operation. Reading
+            # only credits_required/credits_available -- which the prepaid API
+            # never sends -- left every 402 with no price, no balance and no
+            # top-up link, while all three sat in the response body.
+            raise InsufficientFundsError(
                 message=message,
                 status_code=status,
                 response_body=body,
-                credits_required=fields.get("credits_required"),
-                credits_available=fields.get("credits_available"),
+                required_usd=_as_float(fields.get("required_usd")),
+                balance_usd=_as_float(fields.get("balance_usd")),
+                shortfall_usd=_as_float(fields.get("shortfall_usd")),
+                topup_url=fields.get("topup_url") or None,
+                operation=fields.get("operation") or None,
+                # Only a pre-cutover server populates these.
+                credits_required=_as_float(fields.get("credits_required")),
+                credits_available=_as_float(fields.get("credits_available")),
             )
         elif status == 429:
             retry_after = response.headers.get("retry-after") or fields.get("retry_after")
@@ -388,7 +419,8 @@ class FotoHub(_BaseClient):
             Dict with ``images`` list containing URLs, model, credits_used.
 
         Raises:
-            InsufficientCreditsError: If account lacks credits.
+            InsufficientFundsError: If the prepaid USD wallet cannot cover it.
+                Nothing is charged.
             ValidationError: If parameters are invalid.
         """
         payload: dict[str, Any] = {
@@ -444,7 +476,8 @@ class FotoHub(_BaseClient):
             Dict with ``images`` (list of URLs), ``model``, ``credits_used``.
 
         Raises:
-            InsufficientCreditsError: If account lacks credits.
+            InsufficientFundsError: If the prepaid USD wallet cannot cover it.
+                Nothing is charged.
             TimeoutError: If generation doesn't complete within ``timeout``.
             FotoHubError: If generation fails server-side.
         """
@@ -692,7 +725,8 @@ class FotoHub(_BaseClient):
             ``billing``.
 
         Raises:
-            InsufficientCreditsError: If the account lacks credits.
+            InsufficientFundsError: If the prepaid USD wallet cannot cover it.
+                Nothing is charged.
             TimeoutError: If the job does not finish within ``timeout``.
             FotoHubError: If the render fails (credits are refunded server-side).
         """
@@ -1423,11 +1457,16 @@ class FotoHub(_BaseClient):
         return response.json()
 
     def get_topup_packages(self) -> list[dict[str, Any]]:
-        """Get available credit top-up packages.
+        """Get available wallet top-up packages.
+
+        Each package credits its face value in USD to the prepaid wallet.
 
         Returns:
-            List of packages with slug, name, amount_usd, bonus_credits,
-            bonus_pct.
+            List of packages with ``slug``, ``name`` and ``amount_usd``. The
+            ``bonus_credits``/``bonus_pct`` keys this used to document are gone:
+            the top-up webhook only ever credited ``amount_usd``, so the bonus
+            described a transfer nothing performed, and the API has no credit
+            unit to grant.
         """
         response = self._request("GET", "/v1/billing/topup/packages")
         data = response.json()
@@ -2396,7 +2435,8 @@ class AsyncFotoHub(_BaseClient):
             Dict with ``images`` (list of URLs), ``model``, ``credits_used``.
 
         Raises:
-            InsufficientCreditsError: If account lacks credits.
+            InsufficientFundsError: If the prepaid USD wallet cannot cover it.
+                Nothing is charged.
             TimeoutError: If generation doesn't complete within ``timeout``.
             FotoHubError: If generation fails server-side.
         """
@@ -2604,7 +2644,8 @@ class AsyncFotoHub(_BaseClient):
             ``billing``.
 
         Raises:
-            InsufficientCreditsError: If the account lacks credits.
+            InsufficientFundsError: If the prepaid USD wallet cannot cover it.
+                Nothing is charged.
             TimeoutError: If the job does not finish within ``timeout``.
             FotoHubError: If the render fails (credits are refunded server-side).
         """

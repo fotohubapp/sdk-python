@@ -23,7 +23,11 @@ from .client import AsyncFotoHub, FotoHub
 from .exceptions import (
     AuthError,
     FotoHubError,
+    # Deprecated alias for InsufficientFundsError, kept one major version: the
+    # API is prepaid in USD and has no credits. Same class object, so an existing
+    # `except InsufficientCreditsError` keeps working.
     InsufficientCreditsError,
+    InsufficientFundsError,
     RateLimitError,
     ServerError,
     TimeoutError,
@@ -42,7 +46,8 @@ __all__ = [
     "FotoHubError",
     "AuthError",
     "RateLimitError",
-    "InsufficientCreditsError",
+    "InsufficientFundsError",
+    "InsufficientCreditsError",  # deprecated alias
     "ValidationError",
     "ServerError",
     "TimeoutError",

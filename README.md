@@ -452,7 +452,7 @@ and have no SDK helper — see the
 for pkg in client.get_topup_packages():
     # The slugs are historical (topup-50 is now the $15 package) — read
     # amount_usd, never the number in the slug.
-    print(pkg["slug"], pkg["amount_usd"], f"+{pkg['bonus_pct']}% bonus credits")
+    print(pkg["slug"], pkg["amount_usd"], "credited to the wallet")
 
 session = client.create_topup("topup-100")       # a package — this one is $25
 print(session["checkout_url"])
