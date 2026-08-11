@@ -1184,10 +1184,17 @@ class FotoHub(_BaseClient):
     # =========================================================================
 
     def stability_tools(self) -> list[dict[str, Any]]:
-        """List available Stability AI tools and their capabilities.
+        """List available Stability AI tools, their price and their inputs.
 
         Returns:
-            List of tool descriptors with id, name, description, parameters.
+            List of tool descriptors with ``id``, ``model_id``, ``price_usd``,
+            ``currency``, ``unit`` and the three ``requires_*`` flags. There are no
+            ``name``/``description``/``parameters`` keys -- those were never sent.
+
+            ``price_usd`` is per image and spans $0.03 (fast upscale) to $0.60
+            (creative upscale), so read it before picking a tool. ``credits`` is
+            still present but deprecated: a legacy relative weight, not a price,
+            and not proportional to one either.
         """
         response = self._request("GET", "/stability/tools")
         data = response.json()
@@ -1220,7 +1227,11 @@ class FotoHub(_BaseClient):
             **kwargs: Additional tool-specific parameters.
 
         Returns:
-            Dict with output image (base64 or URL), seed, credits_used.
+            Dict with ``image`` (base64, never a URL), ``tool``, ``seed`` (None on
+            the tools that do not sample), and the usual ``cost_usd`` / ``currency``
+            / ``billing`` charge block. There is no ``credits_used``: these tools are
+            paid in USD from the prepaid wallet, from $0.03 to $0.60 per image
+            depending on the tool -- see :meth:`stability_tools`.
         """
         payload: dict[str, Any] = {
             "image": image_base64,
@@ -3081,10 +3092,11 @@ class AsyncFotoHub(_BaseClient):
     # =========================================================================
 
     async def stability_tools(self) -> list[dict[str, Any]]:
-        """List available Stability AI tools and their capabilities.
+        """List available Stability AI tools, priced per image in USD.
 
         Returns:
-            List of tool descriptors with id, name, description, parameters.
+            Tool descriptors with ``id``, ``model_id``, ``price_usd``, ``currency``,
+            ``unit`` and the ``requires_*`` flags. ``credits`` is deprecated.
         """
         response = await self._request("GET", "/stability/tools")
         data = response.json()
@@ -3117,7 +3129,11 @@ class AsyncFotoHub(_BaseClient):
             **kwargs: Additional tool-specific parameters.
 
         Returns:
-            Dict with output image (base64 or URL), seed, credits_used.
+            Dict with ``image`` (base64, never a URL), ``tool``, ``seed`` (None on
+            the tools that do not sample), and the usual ``cost_usd`` / ``currency``
+            / ``billing`` charge block. There is no ``credits_used``: these tools are
+            paid in USD from the prepaid wallet, from $0.03 to $0.60 per image
+            depending on the tool -- see :meth:`stability_tools`.
         """
         payload: dict[str, Any] = {
             "image": image_base64,
