@@ -416,7 +416,9 @@ class FotoHub(_BaseClient):
             seed: Random seed for reproducibility.
 
         Returns:
-            Dict with ``images`` list containing URLs, model, credits_used.
+            Dict with ``images`` (list of URLs), ``model``, ``cost_usd``,
+            ``currency`` and a ``billing`` block. There is no ``credits_used``:
+            the API is prepaid in USD and reads no credit balance.
 
         Raises:
             InsufficientFundsError: If the prepaid USD wallet cannot cover it.
@@ -465,19 +467,32 @@ class FotoHub(_BaseClient):
 
         Args:
             prompt: Text description of the desired image. Any language.
-            aspect_ratio: One of "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9".
-            image_size: Resolution tier — "1K" (~30s), "1.5K" (~90s), or "2K" (~3.5min).
-            num_images: Number of images to generate (1-2).
+            aspect_ratio: One of "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
+                "21:9". This is the one thing the render never trades away: where
+                the GPU's 2048-per-edge ceiling applies, the resolution gives way
+                and the ratio is kept.
+            image_size: Resolution tier — "1K" (~30s), "1.5K" (~90s), or "2K"
+                (~3.5min). "3K" and "4K" are accepted and capped to "2K"; the model
+                renders at most 2048x2048.
+            num_images: Number of images to generate (1-2). Higher values are
+                clamped to 2 before billing.
             seed: Random seed for reproducibility.
-            poll_interval: Seconds to wait between status checks.
+            poll_interval: Seconds to wait between status checks. The poll endpoint
+                is rate-limited per ACCOUNT by tier (30/min on the lowest), and the
+                default 3s costs 20 of those a minute, so raise this for a 2K
+                render or two concurrent jobs will throttle each other.
             timeout: Maximum seconds to wait for completion before raising.
 
         Returns:
-            Dict with ``images`` (list of URLs), ``model``, ``credits_used``.
+            Dict with ``images`` (list of URLs), ``model``, ``job_id``,
+            ``cost_usd`` and ``billing``. IDA Q is self-hosted and renders at
+            $0.00, so ``cost_usd`` is 0 -- and because a zero-price operation is
+            settled without a balance check, this is the one model an empty wallet
+            can still run.
 
         Raises:
             InsufficientFundsError: If the prepaid USD wallet cannot cover it.
-                Nothing is charged.
+                Nothing is charged. Cannot happen at the current $0.00 price.
             TimeoutError: If generation doesn't complete within ``timeout``.
             FotoHubError: If generation fails server-side.
         """
@@ -503,7 +518,13 @@ class FotoHub(_BaseClient):
                 return {
                     "model": "ida-q-image",
                     "job_id": job_id,
-                    "credits_used": job.get("credits_used"),
+                    # The wallet is charged at submit and the poll route reports
+                    # job state only, so the cost has to be carried across or it
+                    # is absent from the result the caller actually receives.
+                    # This used to carry `credits_used`, a field the prepaid API
+                    # stopped returning -- so it was always None.
+                    "cost_usd": job.get("cost_usd", (job.get("billing") or {}).get("cost_usd")),
+                    "currency": "USD",
                     "billing": job.get("billing"),
                     "images": status.get("images", []),
                     "metadata": status.get("metadata"),
@@ -584,12 +605,14 @@ class FotoHub(_BaseClient):
                 is unaffected and may still finish.
 
         Returns:
-            Dict with model, credits_used, video_url, job_id, status, duration.
+            Dict with model, video_url, job_id, status, duration, ``cost_usd``
+            and ``currency``. There is no ``credits_used``: the API is prepaid in
+            USD.
 
         Raises:
-            FotoHubError: If the generation failed. Credits for a failed video
-                are refunded automatically, so a raise here does not mean you
-                paid for nothing delivered.
+            FotoHubError: If the generation failed. A failed video is refunded to
+                the wallet automatically, so a raise here does not mean you paid
+                for nothing delivered.
             TimeoutError: If the job was still processing when ``timeout``
                 elapsed.
         """
@@ -621,11 +644,16 @@ class FotoHub(_BaseClient):
             ).json()
             state = status.get("status", "")
             if state == "completed":
-                # The poll route reports job state, not the charge -- only the
-                # submit response carries `credits_used`. Carry it across so it
-                # is not silently absent on exactly the models that queue.
-                if status.get("credits_used") is None:
-                    status["credits_used"] = result.get("credits_used")
+                # The poll route reports the charge from the job row's
+                # `estimated_cost`, which is null on a row written before that
+                # column held USD. Fall back to the submit response, which always
+                # carries it. Was `credits_used` on both sides -- a field the
+                # prepaid API stopped returning, so this copied None onto None.
+                if status.get("cost_usd") is None:
+                    status["cost_usd"] = result.get("cost_usd")
+                    status.setdefault("currency", "USD")
+                if status.get("billing") is None and result.get("billing"):
+                    status["billing"] = result["billing"]
                 return status
             if state in ("failed", "cancelled"):
                 raise FotoHubError(
@@ -675,7 +703,7 @@ class FotoHub(_BaseClient):
         ``seedance-2-5`` is the only model on the platform that produces a
         30-second clip in one request, and the only one that accepts a source
         video (``reference_videos``) for editing or extension. Native audio is
-        included in its price: 14.5 credits/s at 720p, 6.4 at 480p, the same
+        included in its price: $0.2335/s at 720p, $0.103062/s at 480p, the same
         with ``generate_audio`` on or off. It does **not** do 1080p or 4K — those
         return a 400. For higher resolution use ``seedance-2-0-pro`` (up to 4K,
         but capped at 15s).
@@ -703,8 +731,11 @@ class FotoHub(_BaseClient):
                 ``{"mimeType": ..., "base64": ...}`` dicts.
             reference_videos: Up to 10 on 2.5 (3 on 2.0). Attaching one switches
                 the request to reference / editing / extension mode and raises
-                the rate to 17.6 credits/s at 720p, because the source frames
-                bill as input.
+                the rate to $0.283421/s at 720p ($0.125607 at 480p), because the
+                source frames bill as input tokens. Only 2.5 has that rate; on
+                every other model a reference video costs the plain rate. The
+                response's ``billing.breakdown.video_input`` says which rate you
+                were charged.
             reference_audios: Up to 10 on 2.5 (3 on 2.0). Requires at least one
                 image or video reference.
             asset_ids: Pre-registered ``asset://`` portrait ids from
@@ -721,14 +752,15 @@ class FotoHub(_BaseClient):
 
         Returns:
             The finished job dict — ``video_url``, ``thumbnail_url``, ``status``,
-            ``credits_used``, ``duration``, ``resolution``, ``task_type``,
-            ``billing``.
+            ``cost_usd``, ``currency``, ``duration``, ``resolution``,
+            ``task_type``, ``billing``. There is no ``credits_used``.
 
         Raises:
             InsufficientFundsError: If the prepaid USD wallet cannot cover it.
                 Nothing is charged.
             TimeoutError: If the job does not finish within ``timeout``.
-            FotoHubError: If the render fails (credits are refunded server-side).
+            FotoHubError: If the render fails. A failed render is refunded to the
+                wallet server-side.
         """
         payload = _seedance_payload(
             prompt=prompt, model=model, duration=duration, resolution=resolution,
@@ -887,7 +919,8 @@ class FotoHub(_BaseClient):
             instrumental: Whether to generate instrumental-only (default: True).
 
         Returns:
-            Dict with audio URL, duration, credits_used.
+            Dict with ``audio_url``, ``duration``, ``cost_usd``, ``currency`` and
+            a ``billing`` block. There is no ``credits_used``.
         """
         payload: dict[str, Any] = {
             "prompt": prompt,
@@ -948,7 +981,8 @@ class FotoHub(_BaseClient):
             pitch: Pitch adjustment in semitones (-10 to 10, default: 0).
 
         Returns:
-            Dict with audio URL, duration, credits_used.
+            Dict with ``audio_url``, ``characters_processed``, ``cost_usd``,
+            ``currency`` and a ``billing`` block. There is no ``credits_used``.
         """
         payload: dict[str, Any] = {
             "text": text,
@@ -1008,11 +1042,14 @@ class FotoHub(_BaseClient):
             stream: Not supported -- see Raises.
 
         Returns:
-            Dict with choices, usage and billing. Billed on real token counts,
-            so ``billing["credits_used"]`` is fractional and scales with the
-            length of the answer -- about 0.02 for a short reply, not 1.
-            ``billing["basis"]`` is ``"tokens"`` when the charge came from the
-            model's own usage figures.
+            Dict with choices, usage, ``cost_usd``, ``currency`` and ``billing``.
+            Billed on real token counts at the provider's own per-direction rate,
+            so ``billing["cost_usd"]`` scales with the length of the answer --
+            fractions of a cent for a short reply. ``billing["legs"]`` splits it
+            into input and output. ``billing["basis"]`` is ``"tokens"`` when the
+            charge came from the model's own usage figures, or
+            ``"flat_fallback"`` when the provider omitted them and one 1K output
+            block was charged instead. There is no ``credits_used``.
 
         Raises:
             ValueError: If ``stream=True``. /v1/ai/chat/completions accepts the
@@ -1407,12 +1444,17 @@ class FotoHub(_BaseClient):
     # =========================================================================
 
     def get_balance(self) -> dict[str, Any]:
-        """Get current credit balance and plan info.
+        """Get the wallet balance and this month's spend, in USD.
 
         Returns:
-            Dict with tier, credits (4h/period counters), wallet
-            (``balance`` in USD, ``currency``), overage
-            (``hard_limit_usd``), and api_subscription.
+            Dict with ``wallet`` (``balance_usd``, ``pending_usd``,
+            ``total_topped_up_usd``, ``currency``), ``spend``
+            (``this_month_usd``, ``monthly_limit_usd``, ``remaining_usd``),
+            ``billing_model`` and ``api_subscription``. There is no ``credits``
+            block: it used to report the web app's subscription counter, telling
+            API developers they had hundreds of credits while their spendable
+            balance was $0. ``overage`` is the old name for ``spend`` and is
+            deprecated -- a prepaid wallet has nothing to exceed.
         """
         response = self._request("GET", "/v1/billing/balance")
         return response.json()
@@ -1436,10 +1478,17 @@ class FotoHub(_BaseClient):
         return response.json()
 
     def get_credits(self) -> dict[str, Any]:
-        """Get detailed credit breakdown (included, bonus, topup).
+        """Deprecated. The API has no credits; this returns the wallet.
+
+        Kept because it is a published route, and the endpoint answers 200 with
+        ``deprecated: True`` and an explanation rather than a 404. Use
+        :meth:`get_balance` for the wallet and :meth:`get_pricing` for
+        per-operation USD prices.
 
         Returns:
-            Dict with credit pools and expiration info.
+            Dict with ``deprecated``, ``message``, ``billing_model``, ``wallet``
+            and ``spend``. No credit pools, no expiration: credits exist only in
+            the fotohub.app web app and cannot pay for API usage.
         """
         response = self._request("GET", "/v1/billing/credits")
         return response.json()
@@ -1530,8 +1579,14 @@ class FotoHub(_BaseClient):
                 and relevant parameters (width, height, duration, etc.).
 
         Returns:
-            Dict with total_credits, total_usd, currency, and a breakdown
-            per operation (each with credits and price_usd).
+            Dict with ``total_usd``, ``provider_cost_usd``, ``margin``,
+            ``currency``, ``balance_usd``, ``sufficient``, ``priced`` and a
+            ``breakdown`` per operation. Because the account is prepaid, read
+            ``sufficient`` -- the server's own answer to "can my wallet cover
+            this" -- rather than comparing two numbers yourself. An operation with
+            no published rate comes back ``priced: false`` with
+            ``amount_usd: null``, and then ``total_usd`` covers only the priced
+            legs. ``total_credits`` is deprecated and always ``None``.
         """
         payload: dict[str, Any] = {"operations": operations}
 
@@ -1735,15 +1790,17 @@ class FotoHub(_BaseClient):
             garments: Two garments to apply in one job, e.g.
                 [{"garment_image_url": ..., "category": "tops"},
                  {"garment_id": ..., "category": "bottoms"}].
-                Exactly one top and one bottom, no one-pieces. Costs 3 credits
-                instead of 4 and forces num_images to 1. Order is irrelevant —
-                the top is always applied first.
+                Exactly one top and one bottom, no one-pieces. Billed as one
+                chained render (two Vertex passes) rather than two jobs, and
+                forces num_images to 1. Order is irrelevant — the top is always
+                applied first.
             num_images: Renders to produce, 1-4. Ignored for an outfit.
             seed: Fixed seed for reproducible output.
 
         Returns:
-            Dict with job_id, status, category, credits_used, billing,
-            estimated_seconds and poll_url.
+            Dict with job_id, status, category, ``cost_usd``, ``currency``,
+            ``billing``, estimated_seconds and poll_url. The wallet is charged at
+            submit, so the poll route never reports the cost.
         """
         payload: dict[str, Any] = {
             "person_image_url": person_image_url,
@@ -1835,7 +1892,11 @@ class FotoHub(_BaseClient):
         """Get the full tier catalog (PAYG + subscription tiers).
 
         Returns:
-            Dict with tiers list containing slug, name, type, rpm, credits, price.
+            Dict with ``payg`` and ``subscriptions`` lists (slug, name,
+            description, price_monthly, price_currency, limits, access), plus
+            ``currency``, ``billing_cycle`` and ``overage_policy``. Read
+            ``price_currency`` per entry, not the top-level ``currency``: PAYG
+            thresholds are USD while subscription prices are still PLN.
         """
         response = self._request("GET", "/v1/tiers/catalog")
         return response.json()
@@ -1844,8 +1905,11 @@ class FotoHub(_BaseClient):
         """Get the current user's tier, limits, and usage stats.
 
         Returns:
-            Dict with tier slug, name, limits (rpm, daily_quota, credits_monthly),
-            and usage (rpm_used, daily_used, credits_used).
+            Dict with ``tier``, ``name``, ``category``, ``limits`` (rpm,
+            burst_4h, concurrent_jobs, storage_gb, daily_quota, tpm), ``access``,
+            ``usage`` (used_4h, used_period, requests_today), ``wallet``
+            (balance_usd, pending_usd, lifetime_spend), ``subscription`` and
+            ``upgrade_options``.
         """
         response = self._request("GET", "/v1/tiers/current")
         return response.json()
@@ -1897,7 +1961,12 @@ class FotoHub(_BaseClient):
                 ``amount_usd``.
 
         Returns:
-            Dict with checkout_url, amount_usd, pay_currency, bonus_credits.
+            Dict with ``checkout_url``, ``amount_usd`` and ``pay_currency``.
+            ``bonus_credits`` is still on the wire but always ``None`` and
+            deprecated: the top-up webhook only ever credited ``amount_usd``, so
+            the bonus described a transfer nothing performed. It is null rather
+            than 0 because 0 would read as "this package has no bonus" instead of
+            "there is no such thing".
         """
         payload: dict[str, Any] = {"amount_usd": amount_usd}
         if pay_currency is not None:
@@ -2375,6 +2444,7 @@ class AsyncFotoHub(_BaseClient):
         height: int = 1024,
         aspect_ratio: str = "1:1",
         num_images: int = 1,
+        image_size: Optional[str] = None,
         negative_prompt: Optional[str] = None,
         style: Optional[str] = None,
         seed: Optional[int] = None,
@@ -2387,13 +2457,27 @@ class AsyncFotoHub(_BaseClient):
             width: Image width in pixels.
             height: Image height in pixels.
             aspect_ratio: Aspect ratio string (e.g. "1:1", "16:9", "9:16").
-            num_images: Number of images to generate (1-4).
+            num_images: Whole number of images, 1-8. Charged per image the
+                provider actually delivers: every provider caps the count at its
+                own maximum, and the difference is refunded automatically.
+            image_size: Resolution tier -- "1K", "1.5K", "2K", "3K" or "4K".
+                This is priced: 4K costs more than 1K on any model offering it.
+                Absent from this client until now, which is why an async caller
+                could not ask for "1.5K" at all and had to express a tier through
+                width/height. Leave it None to let width/height pick the tier.
             negative_prompt: Things to avoid in the image.
             style: Style preset (e.g. "photographic", "cinematic", "anime").
             seed: Random seed for reproducibility.
 
         Returns:
-            Dict with ``images`` list containing URLs, model, credits_used.
+            Dict with ``images`` (list of URLs), ``model``, ``cost_usd``,
+            ``currency`` and a ``billing`` block. There is no ``credits_used``:
+            the API is prepaid in USD and reads no credit balance.
+
+        Raises:
+            InsufficientFundsError: If the prepaid USD wallet cannot cover it.
+                Nothing is charged.
+            ValidationError: If parameters are invalid.
         """
         payload: dict[str, Any] = {
             "prompt": prompt,
@@ -2403,6 +2487,8 @@ class AsyncFotoHub(_BaseClient):
             "aspect_ratio": aspect_ratio,
             "num_images": num_images,
         }
+        if image_size is not None:
+            payload["image_size"] = image_size
         if negative_prompt is not None:
             payload["negative_prompt"] = negative_prompt
         if style is not None:
@@ -2435,19 +2521,32 @@ class AsyncFotoHub(_BaseClient):
 
         Args:
             prompt: Text description of the desired image. Any language.
-            aspect_ratio: One of "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9".
-            image_size: Resolution tier — "1K" (~30s), "1.5K" (~90s), or "2K" (~3.5min).
-            num_images: Number of images to generate (1-2).
+            aspect_ratio: One of "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
+                "21:9". This is the one thing the render never trades away: where
+                the GPU's 2048-per-edge ceiling applies, the resolution gives way
+                and the ratio is kept.
+            image_size: Resolution tier — "1K" (~30s), "1.5K" (~90s), or "2K"
+                (~3.5min). "3K" and "4K" are accepted and capped to "2K"; the model
+                renders at most 2048x2048.
+            num_images: Number of images to generate (1-2). Higher values are
+                clamped to 2 before billing.
             seed: Random seed for reproducibility.
-            poll_interval: Seconds to wait between status checks.
+            poll_interval: Seconds to wait between status checks. The poll endpoint
+                is rate-limited per ACCOUNT by tier (30/min on the lowest), and the
+                default 3s costs 20 of those a minute, so raise this for a 2K
+                render or two concurrent jobs will throttle each other.
             timeout: Maximum seconds to wait for completion before raising.
 
         Returns:
-            Dict with ``images`` (list of URLs), ``model``, ``credits_used``.
+            Dict with ``images`` (list of URLs), ``model``, ``job_id``,
+            ``cost_usd`` and ``billing``. IDA Q is self-hosted and renders at
+            $0.00, so ``cost_usd`` is 0 -- and because a zero-price operation is
+            settled without a balance check, this is the one model an empty wallet
+            can still run.
 
         Raises:
             InsufficientFundsError: If the prepaid USD wallet cannot cover it.
-                Nothing is charged.
+                Nothing is charged. Cannot happen at the current $0.00 price.
             TimeoutError: If generation doesn't complete within ``timeout``.
             FotoHubError: If generation fails server-side.
         """
@@ -2476,7 +2575,11 @@ class AsyncFotoHub(_BaseClient):
                 return {
                     "model": "ida-q-image",
                     "job_id": job_id,
-                    "credits_used": job.get("credits_used"),
+                    # See the sync twin: the charge lands at submit, the poll
+                    # reports job state only. `credits_used` was always None here
+                    # because the prepaid API does not return that field.
+                    "cost_usd": job.get("cost_usd", (job.get("billing") or {}).get("cost_usd")),
+                    "currency": "USD",
                     "billing": job.get("billing"),
                     "images": status.get("images", []),
                     "metadata": status.get("metadata"),
@@ -2561,12 +2664,14 @@ class AsyncFotoHub(_BaseClient):
                 is unaffected and may still finish.
 
         Returns:
-            Dict with model, credits_used, video_url, job_id, status, duration.
+            Dict with model, video_url, job_id, status, duration, ``cost_usd``
+            and ``currency``. There is no ``credits_used``: the API is prepaid in
+            USD.
 
         Raises:
-            FotoHubError: If the generation failed. Credits for a failed video
-                are refunded automatically, so a raise here does not mean you
-                paid for nothing delivered.
+            FotoHubError: If the generation failed. A failed video is refunded to
+                the wallet automatically, so a raise here does not mean you paid
+                for nothing delivered.
             TimeoutError: If the job was still processing when ``timeout``
                 elapsed.
         """
@@ -2598,11 +2703,16 @@ class AsyncFotoHub(_BaseClient):
             status = status_resp.json()
             state = status.get("status", "")
             if state == "completed":
-                # The poll route reports job state, not the charge -- only the
-                # submit response carries `credits_used`. Carry it across so it
-                # is not silently absent on exactly the models that queue.
-                if status.get("credits_used") is None:
-                    status["credits_used"] = result.get("credits_used")
+                # The poll route reports the charge from the job row's
+                # `estimated_cost`, which is null on a row written before that
+                # column held USD. Fall back to the submit response, which always
+                # carries it. Was `credits_used` on both sides -- a field the
+                # prepaid API stopped returning, so this copied None onto None.
+                if status.get("cost_usd") is None:
+                    status["cost_usd"] = result.get("cost_usd")
+                    status.setdefault("currency", "USD")
+                if status.get("billing") is None and result.get("billing"):
+                    status["billing"] = result["billing"]
                 return status
             if state in ("failed", "cancelled"):
                 raise FotoHubError(
@@ -2647,18 +2757,21 @@ class AsyncFotoHub(_BaseClient):
         Async counterpart of :meth:`FotoHub.generate_seedance` — same parameters,
         same return shape. ``seedance-2-5`` is the only model that reaches 30
         seconds in a single request (4-30s, 480p/720p, audio included at
-        14.5 credits/s at 720p) and the only one that accepts a source video.
+        $0.2335/s at 720p) and the only one that accepts a source video —
+        attaching one raises the rate to $0.283421/s, since the source frames
+        bill as input tokens.
 
         Returns:
             The finished job dict — ``video_url``, ``thumbnail_url``, ``status``,
-            ``credits_used``, ``duration``, ``resolution``, ``task_type``,
-            ``billing``.
+            ``cost_usd``, ``currency``, ``duration``, ``resolution``,
+            ``task_type``, ``billing``. There is no ``credits_used``.
 
         Raises:
             InsufficientFundsError: If the prepaid USD wallet cannot cover it.
                 Nothing is charged.
             TimeoutError: If the job does not finish within ``timeout``.
-            FotoHubError: If the render fails (credits are refunded server-side).
+            FotoHubError: If the render fails. A failed render is refunded to the
+                wallet server-side.
         """
         payload = _seedance_payload(
             prompt=prompt, model=model, duration=duration, resolution=resolution,
@@ -2795,7 +2908,8 @@ class AsyncFotoHub(_BaseClient):
             instrumental: Whether to generate instrumental-only (default: True).
 
         Returns:
-            Dict with audio URL, duration, credits_used.
+            Dict with ``audio_url``, ``duration``, ``cost_usd``, ``currency`` and
+            a ``billing`` block. There is no ``credits_used``.
         """
         payload: dict[str, Any] = {
             "prompt": prompt,
@@ -2856,7 +2970,8 @@ class AsyncFotoHub(_BaseClient):
             pitch: Pitch adjustment in semitones (-10 to 10, default: 0).
 
         Returns:
-            Dict with audio URL, duration, credits_used.
+            Dict with ``audio_url``, ``characters_processed``, ``cost_usd``,
+            ``currency`` and a ``billing`` block. There is no ``credits_used``.
         """
         payload: dict[str, Any] = {
             "text": text,
@@ -2916,11 +3031,14 @@ class AsyncFotoHub(_BaseClient):
             stream: Not supported -- see Raises.
 
         Returns:
-            Dict with choices, usage and billing. Billed on real token counts,
-            so ``billing["credits_used"]`` is fractional and scales with the
-            length of the answer -- about 0.02 for a short reply, not 1.
-            ``billing["basis"]`` is ``"tokens"`` when the charge came from the
-            model's own usage figures.
+            Dict with choices, usage, ``cost_usd``, ``currency`` and ``billing``.
+            Billed on real token counts at the provider's own per-direction rate,
+            so ``billing["cost_usd"]`` scales with the length of the answer --
+            fractions of a cent for a short reply. ``billing["legs"]`` splits it
+            into input and output. ``billing["basis"]`` is ``"tokens"`` when the
+            charge came from the model's own usage figures, or
+            ``"flat_fallback"`` when the provider omitted them and one 1K output
+            block was charged instead. There is no ``credits_used``.
 
         Raises:
             ValueError: If ``stream=True``. /v1/ai/chat/completions accepts the
@@ -3313,12 +3431,17 @@ class AsyncFotoHub(_BaseClient):
     # =========================================================================
 
     async def get_balance(self) -> dict[str, Any]:
-        """Get current credit balance and plan info.
+        """Get the wallet balance and this month's spend, in USD.
 
         Returns:
-            Dict with tier, credits (4h/period counters), wallet
-            (``balance`` in USD, ``currency``), overage
-            (``hard_limit_usd``), and api_subscription.
+            Dict with ``wallet`` (``balance_usd``, ``pending_usd``,
+            ``total_topped_up_usd``, ``currency``), ``spend``
+            (``this_month_usd``, ``monthly_limit_usd``, ``remaining_usd``),
+            ``billing_model`` and ``api_subscription``. There is no ``credits``
+            block: it used to report the web app's subscription counter, telling
+            API developers they had hundreds of credits while their spendable
+            balance was $0. ``overage`` is the old name for ``spend`` and is
+            deprecated -- a prepaid wallet has nothing to exceed.
         """
         response = await self._request("GET", "/v1/billing/balance")
         return response.json()
@@ -3342,10 +3465,10 @@ class AsyncFotoHub(_BaseClient):
         return response.json()
 
     async def get_credits(self) -> dict[str, Any]:
-        """Get detailed credit breakdown (included, bonus, topup).
+        """Deprecated. The API has no credits; this returns the wallet.
 
-        Returns:
-            Dict with credit pools and expiration info.
+        See :meth:`FotoHub.get_credits`. Answers 200 with ``deprecated: True``,
+        ``billing_model``, ``wallet`` and ``spend``.
         """
         response = await self._request("GET", "/v1/billing/credits")
         return response.json()
@@ -3376,11 +3499,15 @@ class AsyncFotoHub(_BaseClient):
         return response.json()
 
     async def get_topup_packages(self) -> list[dict[str, Any]]:
-        """Get available credit top-up packages.
+        """Get available wallet top-up packages.
+
+        Each package credits its face value in USD to the prepaid wallet.
 
         Returns:
-            List of packages with slug, name, amount_usd, bonus_credits,
-            bonus_pct.
+            List of packages with ``slug``, ``name`` and ``amount_usd``. The
+            ``bonus_credits``/``bonus_pct`` keys this used to document are gone:
+            the top-up webhook only ever credited ``amount_usd``, and the API has
+            no credit unit to grant.
         """
         response = await self._request("GET", "/v1/billing/topup/packages")
         data = response.json()
@@ -3433,8 +3560,14 @@ class AsyncFotoHub(_BaseClient):
                 and relevant parameters (width, height, duration, etc.).
 
         Returns:
-            Dict with total_credits, total_usd, currency, and a breakdown
-            per operation (each with credits and price_usd).
+            Dict with ``total_usd``, ``provider_cost_usd``, ``margin``,
+            ``currency``, ``balance_usd``, ``sufficient``, ``priced`` and a
+            ``breakdown`` per operation. Because the account is prepaid, read
+            ``sufficient`` -- the server's own answer to "can my wallet cover
+            this" -- rather than comparing two numbers yourself. An operation with
+            no published rate comes back ``priced: false`` with
+            ``amount_usd: null``, and then ``total_usd`` covers only the priced
+            legs. ``total_credits`` is deprecated and always ``None``.
         """
         payload: dict[str, Any] = {"operations": operations}
 
@@ -3572,7 +3705,12 @@ class AsyncFotoHub(_BaseClient):
         seed: Optional[int] = None,
     ) -> dict[str, Any]:
         """Dress a person photo in a garment. Pass `garments` (one top plus one
-        bottom) for a chained outfit at 3 credits."""
+        bottom) for a chained outfit, billed as one render of two Vertex passes.
+
+        Returns the same 202 shape as :meth:`FotoHub.tryon` — job_id, status,
+        category, ``cost_usd``, ``currency``, ``billing``, estimated_seconds and
+        poll_url. The wallet is charged at submit; the poll route never reports it.
+        """
         payload: dict[str, Any] = {
             "person_image_url": person_image_url,
             "num_images": num_images,
