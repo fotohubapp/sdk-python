@@ -39,7 +39,7 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4.6"
 DEFAULT_BEDROCK_MODEL = DEFAULT_CLAUDE_MODEL
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
-SDK_VERSION = "1.10.0"
+SDK_VERSION = "1.11.0"
 
 #: Header the API reads to de-duplicate a retried charged request. The SDK sends
 #: one automatically on every guarded POST — see `_idempotency_key_for`.
@@ -1469,10 +1469,17 @@ class FotoHub(_BaseClient):
         return response.json()
 
     def get_plans(self) -> dict[str, Any]:
-        """Get available subscription plans.
+        """Deprecated. There are no paid API plans; the list is always empty.
+
+        .. deprecated:: 1.11.0
+            Paid API plans were retired on 2026-08-13. The endpoint answers
+            ``{"plans": []}`` -- a 200 with nothing to iterate. Rate limits
+            follow the prepaid USD wallet, so :meth:`topup_wallet` /
+            :meth:`create_topup` is the upgrade path and :meth:`compare_tiers`
+            is what to show someone choosing limits.
 
         Returns:
-            Dict with list of plans, their features and pricing.
+            ``{"plans": []}``.
         """
         response = self._request("GET", "/v1/billing/plans")
         return response.json()
@@ -1519,28 +1526,73 @@ class FotoHub(_BaseClient):
     def get_topup_packages(self) -> list[dict[str, Any]]:
         """Get available wallet top-up packages.
 
-        Each package credits its face value in USD to the prepaid wallet.
+        A package credits ``total_usd`` -- the amount paid plus any volume bonus.
+        From $500 up, the ladder adds extra spendable dollars: 5% at $500 rising
+        to 20% at $15 000, so $1 000 paid credits $1 100 and $15 000 credits
+        $18 000. The bonus is ordinary balance, spendable on any operation.
 
         Returns:
-            List of packages with ``slug``, ``name`` and ``amount_usd``. The
-            ``bonus_credits``/``bonus_pct`` keys this used to document are gone:
-            the top-up webhook only ever credited ``amount_usd``, so the bonus
-            described a transfer nothing performed, and the API has no credit
-            unit to grant.
+            List of packages with ``slug``, ``name`` (the amount PAID),
+            ``amount_usd``, ``bonus_usd``, ``total_usd`` and ``bonus_pct``.
+
+            ``bonus_credits`` is gone: the old figure described a credit transfer
+            nothing performed, and this product has no credit unit. ``bonus_usd``
+            is dollars, and it really is credited.
+
+        Note:
+            Use :meth:`get_topup_package_list` when quoting a custom amount --
+            it also returns the ladder and the accepted bounds.
         """
         response = self._request("GET", "/v1/billing/topup/packages")
         data = response.json()
         return data.get("packages", data) if isinstance(data, dict) else data
 
+    def get_topup_package_list(self) -> dict[str, Any]:
+        """Top-up packages plus the bonus ladder and the custom-amount bounds.
+
+        Returns:
+            Dict with ``packages``, ``bonus_tiers`` (highest ``min_usd`` first),
+            ``min_usd``, ``max_usd`` and ``notes``.
+
+        Example:
+            Quote a bonus for an arbitrary amount without hardcoding the ladder::
+
+                import math
+
+                data = client.get_topup_package_list()
+
+                def bonus_for(usd: float) -> float:
+                    for tier in data["bonus_tiers"]:      # already sorted desc
+                        if usd >= tier["min_usd"]:
+                            # Floored to the cent, matching the server.
+                            return math.floor(usd * tier["pct"] * 100) / 100
+                    return 0.0
+
+                bonus_for(2500)   # 300.0
+        """
+        response = self._request("GET", "/v1/billing/topup/packages")
+        return response.json()
+
     def create_topup(self, package: str) -> dict[str, Any]:
-        """Purchase a credit top-up package.
+        """Purchase a wallet top-up package.
 
         Args:
-            package: Package slug (e.g. "topup-50", "topup-100", "topup-250",
-                "topup-500", "topup-1000", "topup-5000").
+            package: Package slug. Starter rungs are ``"topup-50"`` ($15),
+                ``"topup-100"`` ($25), ``"topup-250"`` ($60) and
+                ``"topup-500"`` ($120) -- historical names that do NOT match
+                their amounts. Bonus-earning rungs are ``"scale-500"``,
+                ``"scale-1000"``, ``"scale-2000"``, ``"scale-3000"``,
+                ``"scale-5000"``, ``"scale-7500"``, ``"scale-10000"`` and
+                ``"scale-15000"``, where the number IS the amount in USD.
+                Prefer :meth:`get_topup_packages` over a hardcoded slug.
 
         Returns:
             Dict with checkout_url and the purchased package descriptor.
+
+        Example:
+            ::
+
+                topup = client.create_topup("scale-1000")  # pay $1000, get $1100
         """
         payload: dict[str, Any] = {"package": package}
 
@@ -1893,10 +1945,20 @@ class FotoHub(_BaseClient):
 
         Returns:
             Dict with ``payg`` and ``subscriptions`` lists (slug, name,
-            description, price_monthly, price_currency, limits, access), plus
-            ``currency``, ``billing_cycle`` and ``overage_policy``. Read
-            ``price_currency`` per entry, not the top-level ``currency``: PAYG
-            thresholds are USD while subscription prices are still PLN.
+            description, limits, access), plus ``currency`` (``"USD"``),
+            ``billing_cycle`` (``"prepaid"``), ``subscriptions_retired`` and
+            ``overage_policy``.
+
+            Nothing in the catalog has a price: ``price_monthly`` is ``0`` on
+            PAYG entries and ``None`` on every ``sub-*`` one, all of which carry
+            ``purchasable: False``. The ``subscriptions`` list survives because
+            those rows are the live rate-limit definitions for accounts that
+            already hold a ``sub-*`` tier -- not an offer.
+
+            Watch ``limits``: ``-1`` is the sentinel for "no cap"
+            (``sub-enterprise`` carries it on ``storage_gb``, ``daily_quota``
+            and ``tpm``). Render a negative as unlimited, or it reads as a
+            negative allowance.
         """
         response = self._request("GET", "/v1/tiers/catalog")
         return response.json()
@@ -1915,26 +1977,59 @@ class FotoHub(_BaseClient):
         return response.json()
 
     def compare_tiers(self) -> dict[str, Any]:
-        """Compare all tiers side-by-side with the current tier highlighted.
+        """Compare every tier side-by-side, flattened for a table.
+
+        It does not tell you which tier is yours -- read ``tier`` from
+        :meth:`get_current_tier`.
 
         Returns:
-            Dict with current tier slug and full tier comparison data.
+            Dict with ``tiers`` (flat rows: slug, name, category, description,
+            purchasable, upgrade_path, rpm, concurrent_jobs, storage_gb, models,
+            priority, sla, support), plus ``currency`` (``"USD"``),
+            ``billing_model`` (``"prepaid_wallet_usd"``) and
+            ``subscriptions_retired``.
+
+            No row carries a price or a credit grant: every row is
+            ``purchasable: False`` with an ``upgrade_path`` of ``"wallet_topup"``
+            or, for ``sub-enterprise``, ``"contact_sales"``. Compare on ``rpm``
+            and ``concurrent_jobs``; ``storage_gb`` of ``-1`` means uncapped.
         """
         response = self._request("GET", "/v1/tiers/compare")
         return response.json()
 
     def subscribe_tier(self, tier_slug: str) -> dict[str, Any]:
-        """Subscribe to a tier (returns checkout URL for payment).
+        """Retired on 2026-08-13 -- always raises.
+
+        .. deprecated:: 1.5.0
+            ``POST /v1/tiers/subscribe`` answers **HTTP 410** for every tier.
+            There are no paid API plans any more: rate limits follow the prepaid
+            wallet, so topping up raises the tier on its own with no monthly
+            commitment to cancel. Use :meth:`topup_wallet` or
+            :meth:`create_topup` instead -- and the swap is in your favour, since
+            from $500 up a top-up earns a 5-20% volume bonus in extra spendable
+            dollars.
+
+            ``sub-enterprise`` was never bought this way; it is a contract, via
+            :meth:`apply_enterprise`.
+
+        Kept as a raising stub rather than deleted so upgrading gives a clear
+        message pointing at the replacement instead of an ``AttributeError``.
 
         Args:
-            tier_slug: Tier identifier (e.g. "sub-developer", "sub-startup").
+            tier_slug: Ignored.
 
-        Returns:
-            Dict with checkout_url for completing the subscription.
+        Raises:
+            FotoHubError: Always, with ``status_code=410``.
         """
-        payload: dict[str, Any] = {"tier": tier_slug}
-        response = self._request("POST", "/v1/tiers/subscribe", json_data=payload)
-        return response.json()
+        raise FotoHubError(
+            "API subscription plans were retired on 2026-08-13. Rate limits now "
+            "follow your prepaid wallet balance, so top up instead: "
+            "client.topup_wallet(amount_usd) or client.create_topup(package). "
+            "Top-ups from $500 up earn a 5-20% volume bonus in extra spendable "
+            "dollars. For sub-enterprise, use client.apply_enterprise(...).",
+            status_code=410,
+            response_body={"error": "api_subscriptions_retired"},
+        )
 
     def get_wallet(self) -> dict[str, Any]:
         """Get the current wallet balance and spending info.
@@ -1953,20 +2048,37 @@ class FotoHub(_BaseClient):
     ) -> dict[str, Any]:
         """Top up wallet balance (returns a Stripe checkout URL).
 
+        From $500 up the amount earns a volume bonus in extra spendable dollars
+        -- 5% at $500, 10% at $1 000, rising to 20% at $15 000 -- credited in the
+        same transaction as the payment. The bonus is a function of the amount,
+        not of the package: passing ``1000`` here earns the same +$100 as buying
+        the ``"scale-1000"`` package.
+
         Args:
-            amount_usd: Amount in USD to add (minimum 10, maximum 15000).
+            amount_usd: Amount in USD to add (minimum 10, maximum 15000, whole
+                cents only -- $10.005 is rejected rather than rounded).
             pay_currency: Optional Stripe charge currency, ``"usd"`` (default)
                 or ``"pln"``. With ``"pln"`` a Polish customer pays by
                 BLIK/card/bank transfer while the wallet is still credited
                 ``amount_usd``.
 
         Returns:
-            Dict with ``checkout_url``, ``amount_usd`` and ``pay_currency``.
+            Dict with ``checkout_url``, ``amount_usd`` (charged), ``bonus_usd``,
+            ``total_credited_usd`` (the balance increase -- the figure to show a
+            customer) and ``pay_currency``.
+
             ``bonus_credits`` is still on the wire but always ``None`` and
-            deprecated: the top-up webhook only ever credited ``amount_usd``, so
-            the bonus described a transfer nothing performed. It is null rather
-            than 0 because 0 would read as "this package has no bonus" instead of
-            "there is no such thing".
+            deprecated: it described a credit transfer nothing performed, and
+            this product has no credit unit. It is null rather than 0 because 0
+            would read as "this package has no bonus" instead of "there is no
+            such thing".
+
+        Example:
+            ::
+
+                topup = client.topup_wallet(1000)
+                print(topup["amount_usd"], "->", topup["total_credited_usd"])
+                # 1000 -> 1100.0
         """
         payload: dict[str, Any] = {"amount_usd": amount_usd}
         if pay_currency is not None:
@@ -3456,10 +3568,14 @@ class AsyncFotoHub(_BaseClient):
         return response.json()
 
     async def get_plans(self) -> dict[str, Any]:
-        """Get available subscription plans.
+        """Deprecated. There are no paid API plans; the list is always empty.
+
+        .. deprecated:: 1.11.0
+            See :meth:`FotoHub.get_plans`. The endpoint answers
+            ``{"plans": []}``; fund the wallet to raise limits.
 
         Returns:
-            Dict with list of plans, their features and pricing.
+            ``{"plans": []}``.
         """
         response = await self._request("GET", "/v1/billing/plans")
         return response.json()
@@ -3501,24 +3617,44 @@ class AsyncFotoHub(_BaseClient):
     async def get_topup_packages(self) -> list[dict[str, Any]]:
         """Get available wallet top-up packages.
 
-        Each package credits its face value in USD to the prepaid wallet.
+        A package credits ``total_usd`` -- the amount paid plus any volume bonus.
+        From $500 up, the ladder adds extra spendable dollars: 5% at $500 rising
+        to 20% at $15 000, so $1 000 paid credits $1 100.
 
         Returns:
-            List of packages with ``slug``, ``name`` and ``amount_usd``. The
-            ``bonus_credits``/``bonus_pct`` keys this used to document are gone:
-            the top-up webhook only ever credited ``amount_usd``, and the API has
-            no credit unit to grant.
+            List of packages with ``slug``, ``name`` (the amount PAID),
+            ``amount_usd``, ``bonus_usd``, ``total_usd`` and ``bonus_pct``.
+            ``bonus_credits`` is gone -- it described a credit transfer nothing
+            performed, and this product has no credit unit.
+
+        Note:
+            Use :meth:`get_topup_package_list` when quoting a custom amount.
         """
         response = await self._request("GET", "/v1/billing/topup/packages")
         data = response.json()
         return data.get("packages", data) if isinstance(data, dict) else data
 
+    async def get_topup_package_list(self) -> dict[str, Any]:
+        """Top-up packages plus the bonus ladder and the custom-amount bounds.
+
+        Returns:
+            Dict with ``packages``, ``bonus_tiers`` (highest ``min_usd`` first),
+            ``min_usd``, ``max_usd`` and ``notes``. See the sync
+            :meth:`FotoHub.get_topup_package_list` for a worked bonus quote.
+        """
+        response = await self._request("GET", "/v1/billing/topup/packages")
+        return response.json()
+
     async def create_topup(self, package: str) -> dict[str, Any]:
-        """Purchase a credit top-up package.
+        """Purchase a wallet top-up package.
 
         Args:
-            package: Package slug (e.g. "topup-50", "topup-100", "topup-250",
-                "topup-500", "topup-1000", "topup-5000").
+            package: Package slug. Starter rungs ``"topup-50"`` ($15),
+                ``"topup-100"`` ($25), ``"topup-250"`` ($60), ``"topup-500"``
+                ($120) -- historical names that do NOT match their amounts.
+                Bonus-earning rungs ``"scale-500"`` through ``"scale-15000"``,
+                where the number IS the amount in USD. Prefer
+                :meth:`get_topup_packages` over a hardcoded slug.
 
         Returns:
             Dict with checkout_url and the purchased package descriptor.
@@ -3773,7 +3909,11 @@ class AsyncFotoHub(_BaseClient):
     # =========================================================================
 
     async def get_tier_catalog(self) -> dict[str, Any]:
-        """Get the full tier catalog."""
+        """Get the full tier catalog. See :meth:`FotoHub.get_tier_catalog`.
+
+        Nothing here is purchasable and nothing carries a price; ``-1`` in
+        ``limits`` means "no cap", not a negative allowance.
+        """
         response = await self._request("GET", "/v1/tiers/catalog")
         return response.json()
 
@@ -3783,15 +3923,34 @@ class AsyncFotoHub(_BaseClient):
         return response.json()
 
     async def compare_tiers(self) -> dict[str, Any]:
-        """Compare all tiers side-by-side."""
+        """Compare all tiers side-by-side. See :meth:`FotoHub.compare_tiers`.
+
+        No row carries a price: every one is ``purchasable: False`` with an
+        ``upgrade_path``. Compare on ``rpm`` / ``concurrent_jobs``.
+        """
         response = await self._request("GET", "/v1/tiers/compare")
         return response.json()
 
     async def subscribe_tier(self, tier_slug: str) -> dict[str, Any]:
-        """Subscribe to a tier."""
-        payload: dict[str, Any] = {"tier": tier_slug}
-        response = await self._request("POST", "/v1/tiers/subscribe", json_data=payload)
-        return response.json()
+        """Retired on 2026-08-13 -- always raises.
+
+        .. deprecated:: 1.5.0
+            See :meth:`FotoHub.subscribe_tier`. Rate limits follow the prepaid
+            wallet now; use :meth:`topup_wallet` or :meth:`create_topup`.
+
+        Raises:
+            FotoHubError: Always, with ``status_code=410``.
+        """
+        raise FotoHubError(
+            "API subscription plans were retired on 2026-08-13. Rate limits now "
+            "follow your prepaid wallet balance, so top up instead: "
+            "await client.topup_wallet(amount_usd) or "
+            "await client.create_topup(package). Top-ups from $500 up earn a "
+            "5-20% volume bonus in extra spendable dollars. For sub-enterprise, "
+            "use await client.apply_enterprise(...).",
+            status_code=410,
+            response_body={"error": "api_subscriptions_retired"},
+        )
 
     async def get_wallet(self) -> dict[str, Any]:
         """Get the current wallet balance."""
@@ -3806,9 +3965,13 @@ class AsyncFotoHub(_BaseClient):
     ) -> dict[str, Any]:
         """Top up wallet balance (returns a Stripe checkout URL).
 
-        ``amount_usd`` is in USD (minimum 10, maximum 15000). Pass
-        ``pay_currency="pln"`` to charge in PLN via BLIK/card/bank while still
-        crediting the wallet ``amount_usd``.
+        ``amount_usd`` is in USD (minimum 10, maximum 15000, whole cents only).
+        Pass ``pay_currency="pln"`` to charge in PLN via BLIK/card/bank while
+        still crediting the wallet ``amount_usd``.
+
+        From $500 up the amount earns a 5-20% volume bonus in extra spendable
+        dollars; ``total_credited_usd`` in the response is the balance increase.
+        See the sync :meth:`FotoHub.topup_wallet` for the full response shape.
         """
         payload: dict[str, Any] = {"amount_usd": amount_usd}
         if pay_currency is not None:
