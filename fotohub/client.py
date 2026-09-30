@@ -2975,9 +2975,10 @@ class FotoHub(_BaseClient):
         ONE base fee per run is charged up front; it covers the AI assistant's
         work (AI tokens are not billed separately). Media the run generates
         is billed per item. A failed run is refunded. A run that ends in
-        ``save-conflict`` keeps its draft and can still be applied (see
-        :meth:`apply_video_auto_edit`) within about 70 minutes of the run
-        start, otherwise it is refunded. An applied run is never refunded.
+        ``save-conflict`` keeps its draft, which can be applied (see
+        :meth:`apply_video_auto_edit`) only while the draft lives (at most
+        60 minutes from the run start); a run not applied by about 70
+        minutes is refunded. An applied run is never refunded.
         The call returns the running job (202); follow it with
         :meth:`get_video_job` / ``wait``: ``stages``, ``report`` and ``usage``
         (token counters, no model names) describe the run.
@@ -5376,9 +5377,10 @@ class AsyncFotoHub(_BaseClient):
         ONE base fee per run is charged up front; it covers the AI assistant's
         work (AI tokens are not billed separately). Media the run generates
         is billed per item. A failed run is refunded. A run that ends in
-        ``save-conflict`` keeps its draft and can still be applied (see
-        :meth:`apply_video_auto_edit`) within about 70 minutes of the run
-        start, otherwise it is refunded. An applied run is never refunded.
+        ``save-conflict`` keeps its draft, which can be applied (see
+        :meth:`apply_video_auto_edit`) only while the draft lives (at most
+        60 minutes from the run start); a run not applied by about 70
+        minutes is refunded. An applied run is never refunded.
         The call returns the running job (202); follow it with
         :meth:`get_video_job` / ``wait``: ``stages``, ``report`` and ``usage``
         (token counters, no model names) describe the run.
