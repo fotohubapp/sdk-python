@@ -512,7 +512,7 @@ async def test_keyed_409_idempotency_in_progress_is_retried(retrying, httpx_mock
     assert reqs[0].headers["X-Idempotency-Key"] == reqs[1].headers["X-Idempotency-Key"]
 
 
-# --- auto-edit apply (provisional until the server route exists) ---
+# --- auto-edit apply ---
 
 
 async def test_apply_video_auto_edit_commits_the_draft(api, httpx_mock):
@@ -536,5 +536,30 @@ def test_public_docstrings_use_the_real_op_shape():
     for cls in (FotoHub, AsyncFotoHub):
         doc = inspect.getdoc(cls.apply_video_ops)
         assert '"op": "insertClip"' in doc and "addClip" not in doc and '"type"' not in doc
-        assert "provisional" in inspect.getdoc(cls.auto_edit_video_project).lower()
-        assert "provisional" in inspect.getdoc(cls.apply_video_auto_edit).lower()
+        assert "provisional" not in inspect.getdoc(cls.auto_edit_video_project).lower()
+        assert "provisional" not in inspect.getdoc(cls.apply_video_auto_edit).lower()
+        assert "whole batch is rolled back" not in doc and "skipped" in doc
+
+
+async def test_auto_edit_cut_mode_sends_the_brief(api, httpx_mock):
+    httpx_mock.add_response(method="POST", url=f"{BASE}/v1/video/projects/{PID}/auto-edit", status_code=202,
+                            json={"jobId": JOB, "status": "running", "projectId": PID})
+    brief = {"profile": "highlights", "targetTicks": 1000}
+    out = await api("auto_edit_video_project", PID, mode="cut", brief=brief, aspect="9:16")
+    assert out["status"] == "running"
+    assert body_of(httpx_mock.get_requests()[0]) == {"aiBudgetUsd": 0, "autoApply": True, "mode": "cut",
+                                                     "brief": brief, "aspect": "9:16"}
+
+
+async def test_apply_video_ops_sends_note_and_label(api, httpx_mock):
+    httpx_mock.add_response(method="POST", url=f"{BASE}/v1/video/projects/{PID}/ops", json={"ok": True, "rolledBack": False})
+    await api("apply_video_ops", PID, [{"op": "deleteClip", "clipId": "c1"}], label="l", note="why")
+    body = body_of(httpx_mock.get_requests()[0])
+    assert body["label"] == "l" and body["note"] == "why"
+
+
+async def test_lint_severity_list_and_warning_synonym(api, httpx_mock):
+    httpx_mock.add_response(method="POST", url=f"{BASE}/v1/video/projects/{PID}/lint",
+                            json={"findings": [], "counts": {"error": 0, "warn": 0, "info": 0}, "available": True})
+    await api("lint_video_project", PID, rules=["a"], severity=["error", "warning"])
+    assert body_of(httpx_mock.get_requests()[0]) == {"rules": ["a"], "severity": ["error", "warning"]}

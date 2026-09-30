@@ -257,6 +257,7 @@ def _video_auto_edit_payload(**kw: Any) -> dict[str, Any]:
         "aiBudgetUsd": kw.get("ai_budget_usd"),
         "autoApply": kw.get("auto_apply"),
         "mode": kw.get("mode"),
+        "brief": kw.get("brief"),
     })
 
 
@@ -2732,13 +2733,16 @@ class FotoHub(_BaseClient):
         dry_run: bool = False,
         expected_save_rev: Optional[int] = None,
         label: Optional[str] = None,
+        note: Optional[str] = None,
     ) -> dict[str, Any]:
         """Apply up to 40 editing operations to a project as one atomic batch. Free.
 
         The operation shapes are listed by :meth:`get_video_ops_catalog`. If any
-        operation is rejected the whole batch is rolled back: the project is
-        unchanged and the result has ``rolledBack: True`` with ``violations``
-        (HTTP 200, not an exception).
+        operation is rejected it is skipped and reported in ``results`` (see
+        ``accepted`` / ``rejected``); the rest are applied. The batch is rolled
+        back as a whole only when the resulting document would violate the
+        timeline invariants: then the project is unchanged and the result has
+        ``rolledBack: True`` with ``violations`` (HTTP 200, not an exception).
 
         Args:
             project_id: The project to edit.
@@ -2756,7 +2760,8 @@ class FotoHub(_BaseClient):
                 **not** retried automatically (the batch may already have been
                 saved, and repeating it would apply it twice), so you get the
                 error and must re-read the project yourself.
-            label: Name for the version snapshot saved with this change.
+            label: Name for the version snapshot saved with this change (at most 60 characters).
+            note: Free-form note on why the batch was applied (at most 2000 characters).
 
         Returns:
             :class:`~fotohub.models.ApplyOpsResult` dict: ``ok``, ``rolledBack``,
@@ -2775,6 +2780,7 @@ class FotoHub(_BaseClient):
             "dryRun": True if dry_run else None,
             "expectedSaveRev": expected_save_rev,
             "label": label,
+            "note": note,
         })
         response = self._request(
             "POST", f"/v1/video/projects/{project_id}/ops", json_data=body,
@@ -2814,8 +2820,8 @@ class FotoHub(_BaseClient):
         Args:
             project_id: The project to check.
             rules: Only run these rule ids.
-            severity: Severities to report: "error", "warn" and/or "info" (one
-                string or a list).
+            severity: Severities to report: "error", "warn" (or its synonym
+                "warning") and/or "info" (one string or a list).
 
         Returns:
             :class:`~fotohub.models.LintResult` dict. While the checker is not
@@ -2953,36 +2959,48 @@ class FotoHub(_BaseClient):
         ai_budget_usd: float = 0,
         auto_apply: bool = True,
         mode: str = "auto_edit",
+        brief: Optional[dict[str, Any]] = None,
         wait: bool = False,
         max_wait: float = 1800.0,
         idempotency_key: Optional[str] = None,
     ) -> dict[str, Any]:
         """Let FOTOhub edit the project for you (server-side Auto-Edit). Paid.
 
-        .. note:: Provisional. The server route ships with the Auto-Edit release
-           and its body and result may still change; do not rely on it yet.
+        A base fee is charged up front, plus the AI usage of the run once it
+        finishes. The call returns the running job (202); follow it with
+        :meth:`get_video_job` / ``wait``: ``stages``, ``report`` and ``usage``
+        (token counters, no model names) describe the run.
 
         Args:
             project_id: The project to edit.
-            style: "viral", "podcast", "explainer", "storytelling" or "captions-only".
-            toggles: Feature switches, as in the editor's Auto-Edit panel.
-            language: Spoken language ("auto" to detect).
-            aspect: Target aspect ratio.
-            ai_budget_usd: Cap for AI-generated media, 0-50 (0 = stock only).
-            auto_apply: Commit the result; if false it stays a draft.
-            mode: "auto_edit" or "cut".
+            style: "viral", "podcast", "explainer", "storytelling" or
+                "captions-only". Required for ``mode="auto_edit"``.
+            toggles: Feature switches (``cutSilences``, ``removeFillers``,
+                ``broll``, ``zooms``, ``graphics``, ``sfx``, ``music``,
+                ``captions``, ``maps``); all default to on, ``False`` switches
+                one off.
+            language: "pl", "en", "de" or "auto" (default).
+            aspect: "16:9", "9:16", "1:1" or "4:5"; default the project's aspect.
+            ai_budget_usd: Cap for AI-generated media, 0-50 (0 = stock and
+                existing media only).
+            auto_apply: Commit the result; if false it stays a draft for about
+                30 minutes, to commit with :meth:`apply_video_auto_edit`.
+            mode: "auto_edit" or "cut" (proposes a cut from ``brief``).
+            brief: Required for ``mode="cut"``: the cut brief (profile,
+                targetTicks, pacing, order, ...).
             wait: Poll until finished and return the completed job (with ``report``).
             max_wait: Seconds to wait when ``wait`` is true.
             idempotency_key: Override the automatic ``X-Idempotency-Key``.
 
         Returns:
-            A queued :class:`~fotohub.models.VideoJob`, or the finished one with ``wait``.
+            A running :class:`~fotohub.models.AutoEditJob` (``jobId``,
+            ``status``, ``projectId``, ``billing``), or the finished one with ``wait``.
         """
         response = self._request(
             "POST", f"/v1/video/projects/{project_id}/auto-edit",
             json_data=_video_auto_edit_payload(
                 style=style, toggles=toggles, language=language, aspect=aspect,
-                ai_budget_usd=ai_budget_usd, auto_apply=auto_apply, mode=mode,
+                ai_budget_usd=ai_budget_usd, auto_apply=auto_apply, mode=mode, brief=brief,
             ),
             idempotency_key=idempotency_key,
         )
@@ -2999,9 +3017,6 @@ class FotoHub(_BaseClient):
     ) -> dict[str, Any]:
         """Commit the draft of an Auto-Edit job started with ``auto_apply=False``. Free.
 
-        .. note:: Provisional. The server route ships with the Auto-Edit release
-           and its body and result may still change; do not rely on it yet.
-
         Args:
             project_id: The project the job edited.
             job_id: The ``jobId`` returned by :meth:`auto_edit_video_project`.
@@ -3011,7 +3026,13 @@ class FotoHub(_BaseClient):
             idempotency_key: Override the automatic ``X-Idempotency-Key``.
 
         Returns:
-            The apply result with the new ``saveRev``.
+            :class:`~fotohub.models.ApplyAutoEditResult` dict with the new ``saveRev``.
+
+        Raises:
+            SaveConflictError: 409 ``save-conflict`` (``current_save_rev``); the
+                project moved past ``expected_save_rev`` (default: the revision
+                the run started from). The draft is kept.
+            NotFoundError: 404 ``draft-not-found``: applied already, or expired.
         """
         body = _drop_none({"expectedSaveRev": expected_save_rev})
         response = self._request(
@@ -3024,8 +3045,9 @@ class FotoHub(_BaseClient):
         """Read the state of a render / capture / auto-edit job. Free.
 
         Returns:
-            :class:`~fotohub.models.VideoJob` dict. ``status`` is "queued",
-            "running", "completed", "failed" or "cancelled"; a failed job carries
+            :class:`~fotohub.models.VideoJob` dict (an :class:`~fotohub.models.AutoEditJob`
+            for ``kind == "auto_edit"``). ``status`` is "queued", "running",
+            "completed", "failed" or "cancelled"; a failed job carries
             ``error`` and ``refunded``.
         """
         response = self._request("GET", f"/v1/video/jobs/{job_id}")
@@ -5104,13 +5126,16 @@ class AsyncFotoHub(_BaseClient):
         dry_run: bool = False,
         expected_save_rev: Optional[int] = None,
         label: Optional[str] = None,
+        note: Optional[str] = None,
     ) -> dict[str, Any]:
         """Apply up to 40 editing operations to a project as one atomic batch. Free.
 
         The operation shapes are listed by :meth:`get_video_ops_catalog`. If any
-        operation is rejected the whole batch is rolled back: the project is
-        unchanged and the result has ``rolledBack: True`` with ``violations``
-        (HTTP 200, not an exception).
+        operation is rejected it is skipped and reported in ``results`` (see
+        ``accepted`` / ``rejected``); the rest are applied. The batch is rolled
+        back as a whole only when the resulting document would violate the
+        timeline invariants: then the project is unchanged and the result has
+        ``rolledBack: True`` with ``violations`` (HTTP 200, not an exception).
 
         Args:
             project_id: The project to edit.
@@ -5128,7 +5153,8 @@ class AsyncFotoHub(_BaseClient):
                 **not** retried automatically (the batch may already have been
                 saved, and repeating it would apply it twice), so you get the
                 error and must re-read the project yourself.
-            label: Name for the version snapshot saved with this change.
+            label: Name for the version snapshot saved with this change (at most 60 characters).
+            note: Free-form note on why the batch was applied (at most 2000 characters).
 
         Returns:
             :class:`~fotohub.models.ApplyOpsResult` dict: ``ok``, ``rolledBack``,
@@ -5147,6 +5173,7 @@ class AsyncFotoHub(_BaseClient):
             "dryRun": True if dry_run else None,
             "expectedSaveRev": expected_save_rev,
             "label": label,
+            "note": note,
         })
         response = await self._request(
             "POST", f"/v1/video/projects/{project_id}/ops", json_data=body,
@@ -5186,8 +5213,8 @@ class AsyncFotoHub(_BaseClient):
         Args:
             project_id: The project to check.
             rules: Only run these rule ids.
-            severity: Severities to report: "error", "warn" and/or "info" (one
-                string or a list).
+            severity: Severities to report: "error", "warn" (or its synonym
+                "warning") and/or "info" (one string or a list).
 
         Returns:
             :class:`~fotohub.models.LintResult` dict. While the checker is not
@@ -5325,36 +5352,48 @@ class AsyncFotoHub(_BaseClient):
         ai_budget_usd: float = 0,
         auto_apply: bool = True,
         mode: str = "auto_edit",
+        brief: Optional[dict[str, Any]] = None,
         wait: bool = False,
         max_wait: float = 1800.0,
         idempotency_key: Optional[str] = None,
     ) -> dict[str, Any]:
         """Let FOTOhub edit the project for you (server-side Auto-Edit). Paid.
 
-        .. note:: Provisional. The server route ships with the Auto-Edit release
-           and its body and result may still change; do not rely on it yet.
+        A base fee is charged up front, plus the AI usage of the run once it
+        finishes. The call returns the running job (202); follow it with
+        :meth:`get_video_job` / ``wait``: ``stages``, ``report`` and ``usage``
+        (token counters, no model names) describe the run.
 
         Args:
             project_id: The project to edit.
-            style: "viral", "podcast", "explainer", "storytelling" or "captions-only".
-            toggles: Feature switches, as in the editor's Auto-Edit panel.
-            language: Spoken language ("auto" to detect).
-            aspect: Target aspect ratio.
-            ai_budget_usd: Cap for AI-generated media, 0-50 (0 = stock only).
-            auto_apply: Commit the result; if false it stays a draft.
-            mode: "auto_edit" or "cut".
+            style: "viral", "podcast", "explainer", "storytelling" or
+                "captions-only". Required for ``mode="auto_edit"``.
+            toggles: Feature switches (``cutSilences``, ``removeFillers``,
+                ``broll``, ``zooms``, ``graphics``, ``sfx``, ``music``,
+                ``captions``, ``maps``); all default to on, ``False`` switches
+                one off.
+            language: "pl", "en", "de" or "auto" (default).
+            aspect: "16:9", "9:16", "1:1" or "4:5"; default the project's aspect.
+            ai_budget_usd: Cap for AI-generated media, 0-50 (0 = stock and
+                existing media only).
+            auto_apply: Commit the result; if false it stays a draft for about
+                30 minutes, to commit with :meth:`apply_video_auto_edit`.
+            mode: "auto_edit" or "cut" (proposes a cut from ``brief``).
+            brief: Required for ``mode="cut"``: the cut brief (profile,
+                targetTicks, pacing, order, ...).
             wait: Poll until finished and return the completed job (with ``report``).
             max_wait: Seconds to wait when ``wait`` is true.
             idempotency_key: Override the automatic ``X-Idempotency-Key``.
 
         Returns:
-            A queued :class:`~fotohub.models.VideoJob`, or the finished one with ``wait``.
+            A running :class:`~fotohub.models.AutoEditJob` (``jobId``,
+            ``status``, ``projectId``, ``billing``), or the finished one with ``wait``.
         """
         response = await self._request(
             "POST", f"/v1/video/projects/{project_id}/auto-edit",
             json_data=_video_auto_edit_payload(
                 style=style, toggles=toggles, language=language, aspect=aspect,
-                ai_budget_usd=ai_budget_usd, auto_apply=auto_apply, mode=mode,
+                ai_budget_usd=ai_budget_usd, auto_apply=auto_apply, mode=mode, brief=brief,
             ),
             idempotency_key=idempotency_key,
         )
@@ -5371,9 +5410,6 @@ class AsyncFotoHub(_BaseClient):
     ) -> dict[str, Any]:
         """Commit the draft of an Auto-Edit job started with ``auto_apply=False``. Free.
 
-        .. note:: Provisional. The server route ships with the Auto-Edit release
-           and its body and result may still change; do not rely on it yet.
-
         Args:
             project_id: The project the job edited.
             job_id: The ``jobId`` returned by :meth:`auto_edit_video_project`.
@@ -5383,7 +5419,13 @@ class AsyncFotoHub(_BaseClient):
             idempotency_key: Override the automatic ``X-Idempotency-Key``.
 
         Returns:
-            The apply result with the new ``saveRev``.
+            :class:`~fotohub.models.ApplyAutoEditResult` dict with the new ``saveRev``.
+
+        Raises:
+            SaveConflictError: 409 ``save-conflict`` (``current_save_rev``); the
+                project moved past ``expected_save_rev`` (default: the revision
+                the run started from). The draft is kept.
+            NotFoundError: 404 ``draft-not-found``: applied already, or expired.
         """
         body = _drop_none({"expectedSaveRev": expected_save_rev})
         response = await self._request(
@@ -5396,8 +5438,9 @@ class AsyncFotoHub(_BaseClient):
         """Read the state of a render / capture / auto-edit job. Free.
 
         Returns:
-            :class:`~fotohub.models.VideoJob` dict. ``status`` is "queued",
-            "running", "completed", "failed" or "cancelled"; a failed job carries
+            :class:`~fotohub.models.VideoJob` dict (an :class:`~fotohub.models.AutoEditJob`
+            for ``kind == "auto_edit"``). ``status`` is "queued", "running",
+            "completed", "failed" or "cancelled"; a failed job carries
             ``error`` and ``refunded``.
         """
         response = await self._request("GET", f"/v1/video/jobs/{job_id}")

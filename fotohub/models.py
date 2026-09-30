@@ -343,9 +343,11 @@ class VideoProject(TypedDict, total=False):
 class ApplyOpsResult(TypedDict, total=False):
     """Result of ``apply_video_ops``.
 
-    ``ok`` is False and ``rolledBack`` True when any operation was rejected: the
-    whole batch is discarded, the project and ``saveRev`` are unchanged, and
-    ``violations`` says why. That is a normal answer (HTTP 200), not an exception.
+    A rejected operation is skipped and reported in ``results`` (``accepted`` /
+    ``rejected``). ``ok`` is False and ``rolledBack`` True only when the final
+    document would violate the timeline invariants: the whole batch is then
+    discarded, the project and ``saveRev`` are unchanged, and ``violations``
+    says why. That is a normal answer (HTTP 200), not an exception.
     """
 
     ok: bool
@@ -442,11 +444,91 @@ class CaptureResult(TypedDict, total=False):
     missing: list[CaptureMissing]
 
 
+class AutoEditStage(TypedDict, total=False):
+    """One stage of an Auto-Edit run (``signals``, ``cuts``, ``brief``, ``broll``, ``graphics``, ``audio``, ``captions``, ``apply``)."""
+
+    stage: str
+    #: ``running``, ``done``, ``skipped`` or ``error``.
+    status: str
+    #: 0-100 within the stage, when known.
+    pct: float
+    detail: str
+
+
+class AutoEditUsage(TypedDict, total=False):
+    """Token counters of an Auto-Edit run (no model names) and what they were billed."""
+
+    inputTokens: int
+    cacheReadTokens: int
+    cacheWriteTokens: int
+    outputTokens: int
+    #: True once the AI usage of the finished run has been settled.
+    billed: bool
+    units: float
+    chargedUsd: float
+    chargedCredits: float
+    #: Part of the usage that could not be collected.
+    uncollectedUsd: float
+
+
+class AutoEditError(TypedDict, total=False):
+    code: str
+    message: str
+
+
+class AutoEditJob(TypedDict, total=False):
+    """An Auto-Edit job: the 202 of ``auto_edit_video_project`` (``jobId``, ``status``, ``projectId``, ``billing``) and the ``get_video_job`` view."""
+
+    jobId: str
+    kind: str
+    projectId: str
+    #: ``queued``, ``running``, ``completed``, ``failed`` or ``cancelled``.
+    status: str
+    #: 0-100.
+    progress: int
+    stages: list[AutoEditStage]
+    #: What was done and skipped; carries ``committed``.
+    report: dict[str, Any]
+    usage: AutoEditUsage
+    #: True once the result is in the project; False while it is a draft (``auto_apply=False``).
+    committed: bool
+    #: Project revision after the commit.
+    saveRev: int
+    #: Revision the run started from: the default ``expected_save_rev`` of the apply.
+    baseSaveRev: int
+    #: Project revision now, on a ``save-conflict``.
+    currentSaveRev: int
+    #: Seconds left before an unapplied draft expires.
+    expiresInSeconds: int
+    unchanged: bool
+    draftId: str
+    error: AutoEditError
+    reason: str
+    #: ``failed`` / ``cancelled``: whether the charge was returned.
+    refunded: bool
+    #: Start response (202) only.
+    billing: dict[str, Any]
+    chargedCredits: float
+
+
+class ApplyAutoEditResult(TypedDict, total=False):
+    """Result of ``apply_video_auto_edit``."""
+
+    jobId: str
+    projectId: str
+    committed: bool
+    saveRev: int
+    unchanged: bool
+    digest: dict[str, Any]
+    versionSaved: bool
+    warnings: list[Any]
+
+
 class VideoJob(TypedDict, total=False):
     """A render or capture job: ``POST .../render|capture`` answers 202 with one, ``GET /v1/video/jobs/{id}`` polls it."""
 
     jobId: str
-    #: ``render`` or ``capture`` (``auto_edit`` once available). Only on polls.
+    #: ``render`` or ``capture`` (``auto_edit``, see :class:`AutoEditJob`). Only on polls.
     kind: str
     projectId: str
     #: ``queued``, ``running``, ``completed``, ``failed`` or ``cancelled``.
