@@ -76,9 +76,10 @@ _IDEMPOTENCY_EXCLUDE_PREFIXES: tuple[str, ...] = (
 )
 
 
-#: Timeline POSTs that are free, idempotent by nature and answer 409 for a real
-#: reason (`save-conflict`). A key here would make `_should_retry` treat that 409
-#: as "request in flight" and retry a conflict that can never resolve itself.
+#: Timeline POSTs that are free and carry no idempotency key. Digest and lint are
+#: read-only. `ops` is not: it is protected by `expected_save_rev` instead (see
+#: `_retry_ambiguous`), because a keyed replay of a lost 2xx is not needed for a
+#: call whose duplicate the server can refuse with `save-conflict`.
 _UNGUARDED_TIMELINE_POST = re.compile(r"^/v1/video/projects/[^/]+/(ops|digest|lint)$")
 
 
@@ -105,6 +106,24 @@ def _idempotency_key_for(method: str, path: str, stream: bool) -> Optional[str]:
     if _UNGUARDED_TIMELINE_POST.match(path):
         return None
     return str(uuid.uuid4())
+
+
+def _is_idempotency_in_progress(response: httpx.Response) -> bool:
+    """Whether a 409 means "a request with this key is still running".
+
+    Decided by the envelope's error code. A body with no readable code (an older
+    server, a proxy) counts only when it carries `Retry-After`, which the API
+    sends with this 409 and with no other.
+    """
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    envelope = body.get("error") if isinstance(body, dict) else None
+    code = envelope.get("code") if isinstance(envelope, dict) else None
+    if isinstance(code, str):
+        return code == "idempotency-in-progress"
+    return "retry-after" in response.headers
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -263,6 +282,7 @@ def _video_job_failure(job: dict[str, Any]) -> VideoJobFailedError:
         job_id=job_id,
         reason=reason,
         refunded=job.get("refunded"),
+        code=job.get("code") if isinstance(job.get("code"), str) else None,
         response_body=job,
     )
 
@@ -364,6 +384,18 @@ class _BaseClient:
                 response_body=body,
                 current_save_rev=int(rev) if isinstance(rev, (int, float)) and not isinstance(rev, bool) else None,
             )
+        if status == 403 and fields.get("code") == "payment-required":
+            # Empty prepaid wallet / no API entitlement: a funds problem, not a bad key.
+            raise InsufficientFundsError(
+                message=message,
+                status_code=status,
+                response_body=body,
+                required_usd=_as_float(fields.get("required_usd")),
+                balance_usd=_as_float(fields.get("balance_usd")),
+                shortfall_usd=_as_float(fields.get("shortfall_usd")),
+                topup_url=fields.get("topup_url") or None,
+                operation=fields.get("operation") or None,
+            )
         if status == 401 or status == 403:
             raise AuthError(message=message, status_code=status, response_body=body)
         elif status == 402:
@@ -388,8 +420,8 @@ class _BaseClient:
         elif status == 429:
             retry_after = (
                 response.headers.get("retry-after")
+                or fields.get("retryAfterSeconds")
                 or fields.get("retry_after")
-                or fields.get("retryAfter")
             )
             raise RateLimitError(
                 message=message,
@@ -409,19 +441,33 @@ class _BaseClient:
         else:
             raise FotoHubError(message=message, status_code=status, response_body=body)
 
-    def _should_retry(self, status_code: int, *, idempotent: bool = False) -> bool:
-        """Determine if a request should be retried based on status code.
+    def _should_retry(
+        self,
+        response: httpx.Response,
+        *,
+        idempotent: bool = False,
+        retry_ambiguous: bool = True,
+    ) -> bool:
+        """Determine if a request should be retried based on the response.
 
-        `idempotent` adds 409 to the retryable set. On a guarded endpoint the
-        API answers 409 with `Retry-After` when a request carrying this same key
-        is still in flight — which, on a retry, is our own earlier attempt. The
-        right move is to wait and collect its result, not to surface the 409 as
-        a failure. Without an idempotency key a 409 means something else
-        entirely (a genuine conflict) and must not be retried.
+        `idempotent` adds one 409 to the retryable set: `idempotency-in-progress`.
+        On a guarded endpoint the API answers it, with `Retry-After`, when a
+        request carrying this same key is still in flight -- which, on a retry,
+        is our own earlier attempt. The right move is to wait and collect its
+        result. Every other 409 (`save-conflict`, `project-limit`,
+        `draft-limit`, ...) is a real answer that repeating cannot change, so it
+        is raised at once. Without an idempotency key a 409 is never retried.
+
+        `retry_ambiguous=False` is for writes that are neither keyed nor
+        naturally repeatable: after a 5xx the server may already have applied
+        the change, so only 429 (rejected before it ran) is safe to repeat.
         """
-        if idempotent and status_code == 409:
+        status_code = response.status_code
+        if status_code == 409:
+            return idempotent and _is_idempotency_in_progress(response)
+        if status_code == 429:
             return True
-        return status_code in (429, 500, 502, 503, 504)
+        return retry_ambiguous and status_code in (500, 502, 503, 504)
 
     def _backoff_delay(self, attempt: int) -> float:
         """Calculate exponential backoff delay in seconds."""
@@ -469,8 +515,12 @@ class FotoHub(_BaseClient):
         params: Optional[dict[str, Any]] = None,
         stream: bool = False,
         idempotency_key: Optional[str] = None,
+        retry_ambiguous: bool = True,
     ) -> httpx.Response:
         """Make an HTTP request with retry logic.
+
+        `retry_ambiguous=False` disables retries after a 5xx or a timeout, for
+        unkeyed writes whose first attempt may already have been applied.
 
         Every retry of a charged POST carries the same `X-Idempotency-Key`, so a
         timeout or a 5xx that arrives after the work has already started is
@@ -496,7 +546,8 @@ class FotoHub(_BaseClient):
                     return response
 
                 if self._should_retry(
-                    response.status_code, idempotent=idem_key is not None
+                    response, idempotent=idem_key is not None,
+                    retry_ambiguous=retry_ambiguous,
                 ) and attempt < self.max_retries - 1:
                     delay = self._backoff_delay(attempt)
                     retry_after = response.headers.get("retry-after")
@@ -509,6 +560,10 @@ class FotoHub(_BaseClient):
 
             except (httpx.TimeoutException, httpx.ConnectError) as e:
                 last_exception = e
+                # A read/write timeout may hide an applied write; only a failure
+                # to connect at all is known to have changed nothing.
+                if not retry_ambiguous and not isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
+                    raise TimeoutError(message=f"Request failed: {e}")
                 if attempt < self.max_retries - 1:
                     time.sleep(self._backoff_delay(attempt))
                     continue
@@ -2687,17 +2742,28 @@ class FotoHub(_BaseClient):
 
         Args:
             project_id: The project to edit.
-            ops: Operation objects, e.g. ``{"type": "addClip", ...}``.
+            ops: Operation objects. Each one is discriminated by ``op``; the
+                full list with schemas is :meth:`get_video_ops_catalog`. For
+                example ``{"op": "insertClip", "ref": "intro", "at": {...},
+                "clip": {...}}``. ``ref`` names a new clip so later operations in
+                the batch, and your code (via ``refs`` in the result), can
+                address it.
             dry_run: Validate and preview the effect without saving.
             expected_save_rev: The ``saveRev`` you last read. If the project
                 changed since (the browser editor, another agent), nothing is
                 written and :class:`~fotohub.SaveConflictError` is raised.
+                Set it whenever you can: without it a timeout or a 5xx is
+                **not** retried automatically (the batch may already have been
+                saved, and repeating it would apply it twice), so you get the
+                error and must re-read the project yourself.
             label: Name for the version snapshot saved with this change.
 
         Returns:
             :class:`~fotohub.models.ApplyOpsResult` dict: ``ok``, ``rolledBack``,
-            ``violations``, the new ``saveRev``, ``digestDelta``, ``versionSaved``
-            and ``warnings``.
+            ``violations``, per-operation ``results`` with ``summary``,
+            ``accepted`` / ``rejected`` counts, ``refs`` (your ``ref`` names
+            mapped to the ids of the clips they created), the new ``saveRev``,
+            ``digestDelta``, ``versionSaved`` and ``warnings``.
 
         Raises:
             SaveConflictError: 409 ``save-conflict``; re-read the project
@@ -2711,7 +2777,8 @@ class FotoHub(_BaseClient):
             "label": label,
         })
         response = self._request(
-            "POST", f"/v1/video/projects/{project_id}/ops", json_data=body
+            "POST", f"/v1/video/projects/{project_id}/ops", json_data=body,
+            retry_ambiguous=expected_save_rev is not None,
         )
         return response.json()
 
@@ -2740,20 +2807,26 @@ class FotoHub(_BaseClient):
         project_id: str,
         *,
         rules: Optional[list[str]] = None,
-        severity: Optional[str] = None,
+        severity: Optional[Union[str, list[str]]] = None,
     ) -> dict[str, Any]:
         """Check a project for editing problems (gaps, clipping, overlaps, ...). Free.
 
         Args:
             project_id: The project to check.
             rules: Only run these rule ids.
-            severity: Minimum severity to report: "error", "warn" or "info".
+            severity: Severities to report: "error", "warn" and/or "info" (one
+                string or a list).
 
         Returns:
-            :class:`~fotohub.models.LintResult` dict. ``code`` is
-            ``lint-unavailable`` (HTTP 501) while the checker is not deployed.
+            :class:`~fotohub.models.LintResult` dict. While the checker is not
+            deployed the call still succeeds, with ``available: False`` and
+            ``warnings: ["lint-unavailable"]``. A 501 ``lint-unavailable`` error
+            means the whole endpoint is missing.
         """
-        body = _drop_none({"rules": rules, "severity": severity})
+        body = _drop_none({
+            "rules": rules,
+            "severity": [severity] if isinstance(severity, str) else severity,
+        })
         response = self._request(
             "POST", f"/v1/video/projects/{project_id}/lint", json_data=body
         )
@@ -2886,6 +2959,9 @@ class FotoHub(_BaseClient):
     ) -> dict[str, Any]:
         """Let FOTOhub edit the project for you (server-side Auto-Edit). Paid.
 
+        .. note:: Provisional. The server route ships with the Auto-Edit release
+           and its body and result may still change; do not rely on it yet.
+
         Args:
             project_id: The project to edit.
             style: "viral", "podcast", "explainer", "storytelling" or "captions-only".
@@ -2912,6 +2988,37 @@ class FotoHub(_BaseClient):
         )
         job = response.json()
         return self.wait_for_video_job(job["jobId"], timeout=max_wait) if wait else job
+
+    def apply_video_auto_edit(
+        self,
+        project_id: str,
+        job_id: str,
+        *,
+        expected_save_rev: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Commit the draft of an Auto-Edit job started with ``auto_apply=False``. Free.
+
+        .. note:: Provisional. The server route ships with the Auto-Edit release
+           and its body and result may still change; do not rely on it yet.
+
+        Args:
+            project_id: The project the job edited.
+            job_id: The ``jobId`` returned by :meth:`auto_edit_video_project`.
+            expected_save_rev: The ``saveRev`` you last read; if the project
+                changed since, nothing is written and
+                :class:`~fotohub.SaveConflictError` is raised (the draft stays).
+            idempotency_key: Override the automatic ``X-Idempotency-Key``.
+
+        Returns:
+            The apply result with the new ``saveRev``.
+        """
+        body = _drop_none({"expectedSaveRev": expected_save_rev})
+        response = self._request(
+            "POST", f"/v1/video/projects/{project_id}/auto-edit/{job_id}/apply",
+            json_data=body, idempotency_key=idempotency_key,
+        )
+        return response.json()
 
     def get_video_job(self, job_id: str) -> dict[str, Any]:
         """Read the state of a render / capture / auto-edit job. Free.
@@ -3134,8 +3241,11 @@ class AsyncFotoHub(_BaseClient):
         params: Optional[dict[str, Any]] = None,
         stream: bool = False,
         idempotency_key: Optional[str] = None,
+        retry_ambiguous: bool = True,
     ) -> httpx.Response:
         """Make an async HTTP request with retry logic.
+
+        `retry_ambiguous=False`: see the sync client.
 
         Same idempotency contract as the sync client: one key per logical call,
         reused across that call's retries. See `_idempotency_key_for`.
@@ -3162,7 +3272,8 @@ class AsyncFotoHub(_BaseClient):
                     return response
 
                 if self._should_retry(
-                    response.status_code, idempotent=idem_key is not None
+                    response, idempotent=idem_key is not None,
+                    retry_ambiguous=retry_ambiguous,
                 ) and attempt < self.max_retries - 1:
                     delay = self._backoff_delay(attempt)
                     retry_after = response.headers.get("retry-after")
@@ -3175,6 +3286,10 @@ class AsyncFotoHub(_BaseClient):
 
             except (httpx.TimeoutException, httpx.ConnectError) as e:
                 last_exception = e
+                # A read/write timeout may hide an applied write; only a failure
+                # to connect at all is known to have changed nothing.
+                if not retry_ambiguous and not isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
+                    raise TimeoutError(message=f"Request failed: {e}")
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self._backoff_delay(attempt))
                     continue
@@ -4999,17 +5114,28 @@ class AsyncFotoHub(_BaseClient):
 
         Args:
             project_id: The project to edit.
-            ops: Operation objects, e.g. ``{"type": "addClip", ...}``.
+            ops: Operation objects. Each one is discriminated by ``op``; the
+                full list with schemas is :meth:`get_video_ops_catalog`. For
+                example ``{"op": "insertClip", "ref": "intro", "at": {...},
+                "clip": {...}}``. ``ref`` names a new clip so later operations in
+                the batch, and your code (via ``refs`` in the result), can
+                address it.
             dry_run: Validate and preview the effect without saving.
             expected_save_rev: The ``saveRev`` you last read. If the project
                 changed since (the browser editor, another agent), nothing is
                 written and :class:`~fotohub.SaveConflictError` is raised.
+                Set it whenever you can: without it a timeout or a 5xx is
+                **not** retried automatically (the batch may already have been
+                saved, and repeating it would apply it twice), so you get the
+                error and must re-read the project yourself.
             label: Name for the version snapshot saved with this change.
 
         Returns:
             :class:`~fotohub.models.ApplyOpsResult` dict: ``ok``, ``rolledBack``,
-            ``violations``, the new ``saveRev``, ``digestDelta``, ``versionSaved``
-            and ``warnings``.
+            ``violations``, per-operation ``results`` with ``summary``,
+            ``accepted`` / ``rejected`` counts, ``refs`` (your ``ref`` names
+            mapped to the ids of the clips they created), the new ``saveRev``,
+            ``digestDelta``, ``versionSaved`` and ``warnings``.
 
         Raises:
             SaveConflictError: 409 ``save-conflict``; re-read the project
@@ -5023,7 +5149,8 @@ class AsyncFotoHub(_BaseClient):
             "label": label,
         })
         response = await self._request(
-            "POST", f"/v1/video/projects/{project_id}/ops", json_data=body
+            "POST", f"/v1/video/projects/{project_id}/ops", json_data=body,
+            retry_ambiguous=expected_save_rev is not None,
         )
         return response.json()
 
@@ -5052,20 +5179,26 @@ class AsyncFotoHub(_BaseClient):
         project_id: str,
         *,
         rules: Optional[list[str]] = None,
-        severity: Optional[str] = None,
+        severity: Optional[Union[str, list[str]]] = None,
     ) -> dict[str, Any]:
         """Check a project for editing problems (gaps, clipping, overlaps, ...). Free.
 
         Args:
             project_id: The project to check.
             rules: Only run these rule ids.
-            severity: Minimum severity to report: "error", "warn" or "info".
+            severity: Severities to report: "error", "warn" and/or "info" (one
+                string or a list).
 
         Returns:
-            :class:`~fotohub.models.LintResult` dict. ``code`` is
-            ``lint-unavailable`` (HTTP 501) while the checker is not deployed.
+            :class:`~fotohub.models.LintResult` dict. While the checker is not
+            deployed the call still succeeds, with ``available: False`` and
+            ``warnings: ["lint-unavailable"]``. A 501 ``lint-unavailable`` error
+            means the whole endpoint is missing.
         """
-        body = _drop_none({"rules": rules, "severity": severity})
+        body = _drop_none({
+            "rules": rules,
+            "severity": [severity] if isinstance(severity, str) else severity,
+        })
         response = await self._request(
             "POST", f"/v1/video/projects/{project_id}/lint", json_data=body
         )
@@ -5198,6 +5331,9 @@ class AsyncFotoHub(_BaseClient):
     ) -> dict[str, Any]:
         """Let FOTOhub edit the project for you (server-side Auto-Edit). Paid.
 
+        .. note:: Provisional. The server route ships with the Auto-Edit release
+           and its body and result may still change; do not rely on it yet.
+
         Args:
             project_id: The project to edit.
             style: "viral", "podcast", "explainer", "storytelling" or "captions-only".
@@ -5224,6 +5360,37 @@ class AsyncFotoHub(_BaseClient):
         )
         job = response.json()
         return await self.wait_for_video_job(job["jobId"], timeout=max_wait) if wait else job
+
+    async def apply_video_auto_edit(
+        self,
+        project_id: str,
+        job_id: str,
+        *,
+        expected_save_rev: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Commit the draft of an Auto-Edit job started with ``auto_apply=False``. Free.
+
+        .. note:: Provisional. The server route ships with the Auto-Edit release
+           and its body and result may still change; do not rely on it yet.
+
+        Args:
+            project_id: The project the job edited.
+            job_id: The ``jobId`` returned by :meth:`auto_edit_video_project`.
+            expected_save_rev: The ``saveRev`` you last read; if the project
+                changed since, nothing is written and
+                :class:`~fotohub.SaveConflictError` is raised (the draft stays).
+            idempotency_key: Override the automatic ``X-Idempotency-Key``.
+
+        Returns:
+            The apply result with the new ``saveRev``.
+        """
+        body = _drop_none({"expectedSaveRev": expected_save_rev})
+        response = await self._request(
+            "POST", f"/v1/video/projects/{project_id}/auto-edit/{job_id}/apply",
+            json_data=body, idempotency_key=idempotency_key,
+        )
+        return response.json()
 
     async def get_video_job(self, job_id: str) -> dict[str, Any]:
         """Read the state of a render / capture / auto-edit job. Free.

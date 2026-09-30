@@ -301,8 +301,13 @@ class VideoProjectMedia(TypedDict, total=False):
     assetId: str
     kind: str
     name: str
+    #: Signed URL of the media; refreshed on every read, expires.
+    src: str
     storagePath: str
+    #: Seconds.
     duration: float
+    durationTicks: int
+    hasAudio: bool
     width: int
     height: int
 
@@ -347,6 +352,14 @@ class ApplyOpsResult(TypedDict, total=False):
     rolledBack: bool
     dryRun: bool
     violations: list[dict[str, Any]]
+    #: One entry per submitted operation, in order (``ok`` plus the reason when rejected).
+    results: list[dict[str, Any]]
+    summary: Any
+    #: How many operations were accepted / rejected.
+    accepted: int
+    rejected: int
+    #: Your ``ref`` names mapped to the ids of the clips the batch created.
+    refs: dict[str, str]
     saveRev: int
     digestDelta: dict[str, Any]
     #: False when the automatic version snapshot could not be stored (see ``warnings``).
@@ -356,19 +369,39 @@ class ApplyOpsResult(TypedDict, total=False):
 
 class LintFinding(TypedDict, total=False):
     rule: str
+    #: ``error``, ``warn`` or ``info``.
     severity: str
     message: str
+    #: First clip the finding is about, and all of them when there are several.
     clipId: str
-    trackId: str
-    t: float
+    clipIds: list[str]
+    #: Position on the timeline (ticks and seconds); ``end`` / ``endSeconds`` close the range.
+    at: int
+    atSeconds: float
+    end: int
+    endSeconds: float
+    #: Numbers and texts from the rule, e.g. ``{"seconds": 1.4}``.
+    params: dict[str, Any]
+    #: Hint: ``relink``, ``trim-to-content`` or ``none``.
+    fix: str
+    suggestion: str
+
+
+class LintCounts(TypedDict):
+    error: int
+    warn: int
+    info: int
 
 
 class LintResult(TypedDict, total=False):
     """Result of ``lint_video_project``."""
 
-    findings: list[LintFinding]
-    summary: dict[str, Any]
     saveRev: int
+    findings: list[LintFinding]
+    counts: LintCounts
+    #: False while the checker is not deployed; ``warnings`` then holds ``lint-unavailable``.
+    available: bool
+    warnings: list[str]
 
 
 class CaptureFrame(TypedDict):
@@ -413,7 +446,7 @@ class VideoJob(TypedDict, total=False):
     """A render or capture job: ``POST .../render|capture`` answers 202 with one, ``GET /v1/video/jobs/{id}`` polls it."""
 
     jobId: str
-    #: ``render`` or ``capture`` (``auto_edit`` once available).
+    #: ``render`` or ``capture`` (``auto_edit`` once available). Only on polls.
     kind: str
     projectId: str
     #: ``queued``, ``running``, ``completed``, ``failed`` or ``cancelled``.
@@ -423,8 +456,16 @@ class VideoJob(TypedDict, total=False):
     #: Render, ``completed``: the finished file.
     outputUrl: str
     outputSize: int
-    #: Render: minutes billed for.
+    #: Render: minutes billed for (start response only).
     billedMinutes: float
+    #: Start response (202) only: what the call charged, prepaid USD.
+    cost_usd: float
+    currency: str
+    billing: dict[str, Any]
+    #: Only when part of the charge was drawn from subscription credits.
+    chargedCredits: float
+    #: Capture start response: the requested points.
+    cuts: bool
     #: ``failed`` / ``cancelled``.
     error: str
     reason: str
