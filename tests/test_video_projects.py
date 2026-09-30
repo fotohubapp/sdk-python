@@ -353,6 +353,19 @@ async def test_wait_for_video_job_polls_until_completed(api, httpx_mock):
     assert out["status"] == "completed" and len(httpx_mock.get_requests()) == 4
 
 
+async def test_wait_for_auto_edit_failure_exposes_code_rev_and_draft(api, httpx_mock):
+    httpx_mock.add_response(method="GET", url=f"{BASE}/v1/video/jobs/{JOB}",
+                            json={"jobId": JOB, "status": "failed", "kind": "auto_edit", "refunded": False,
+                                  "error": {"code": "save-conflict", "message": "project changed during the run"},
+                                  "currentSaveRev": 9, "draftId": "d-1"})
+    with pytest.raises(VideoJobFailedError) as exc:
+        await api("wait_for_video_job", JOB)
+    e = exc.value
+    assert e.code == "save-conflict" and e.reason == "save-conflict"
+    assert e.current_save_rev == 9 and e.draft_id == "d-1" and e.refunded is False
+    assert "project changed during the run" in e.message and "{" not in e.message
+
+
 async def test_wait_for_video_job_cancelled_raises(api, httpx_mock):
     httpx_mock.add_response(method="GET", url=f"{BASE}/v1/video/jobs/{JOB}",
                             json={"jobId": JOB, "status": "cancelled", "reason": "stale", "refunded": False})

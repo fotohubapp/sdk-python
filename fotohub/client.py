@@ -277,13 +277,21 @@ _VIDEO_JOB_FAILED = ("failed", "cancelled")
 def _video_job_failure(job: dict[str, Any]) -> VideoJobFailedError:
     job_id = job.get("jobId")
     reason = job.get("reason")
-    detail = job.get("error") or reason or job.get("status")
+    error = job.get("error")
+    error_code = error.get("code") if isinstance(error, dict) and isinstance(error.get("code"), str) else None
+    if isinstance(error, dict):
+        error = error.get("message") or error_code
+    detail = error or reason or job.get("status")
+    code = job.get("code") if isinstance(job.get("code"), str) else error_code
+    rev = job.get("currentSaveRev")
     return VideoJobFailedError(
         message=f"Video job {job_id} {job.get('status')}: {detail}",
         job_id=job_id,
-        reason=reason,
+        reason=reason or error_code,
         refunded=job.get("refunded"),
-        code=job.get("code") if isinstance(job.get("code"), str) else None,
+        current_save_rev=int(rev) if isinstance(rev, (int, float)) and not isinstance(rev, bool) else None,
+        draft_id=job.get("draftId") if isinstance(job.get("draftId"), str) else None,
+        code=code,
         response_body=job,
     )
 
@@ -2735,7 +2743,7 @@ class FotoHub(_BaseClient):
         label: Optional[str] = None,
         note: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Apply up to 40 editing operations to a project as one atomic batch. Free.
+        """Apply up to 40 editing operations to a project in one request. Free.
 
         The operation shapes are listed by :meth:`get_video_ops_catalog`. If any
         operation is rejected it is skipped and reported in ``results`` (see
@@ -2824,10 +2832,8 @@ class FotoHub(_BaseClient):
                 "warning") and/or "info" (one string or a list).
 
         Returns:
-            :class:`~fotohub.models.LintResult` dict. While the checker is not
-            deployed the call still succeeds, with ``available: False`` and
-            ``warnings: ["lint-unavailable"]``. A 501 ``lint-unavailable`` error
-            means the whole endpoint is missing.
+            :class:`~fotohub.models.LintResult` dict: ``findings`` and their
+            ``counts``.
         """
         body = _drop_none({
             "rules": rules,
@@ -2966,8 +2972,13 @@ class FotoHub(_BaseClient):
     ) -> dict[str, Any]:
         """Let FOTOhub edit the project for you (server-side Auto-Edit). Paid.
 
-        A base fee is charged up front, plus the AI usage of the run once it
-        finishes. The call returns the running job (202); follow it with
+        ONE base fee per run is charged up front; it covers the AI assistant's
+        work (AI tokens are not billed separately). Media the run generates
+        is billed per item. A failed run is refunded. A run that ends in
+        ``save-conflict`` keeps its draft and can still be applied (see
+        :meth:`apply_video_auto_edit`) within about 70 minutes of the run
+        start, otherwise it is refunded. An applied run is never refunded.
+        The call returns the running job (202); follow it with
         :meth:`get_video_job` / ``wait``: ``stages``, ``report`` and ``usage``
         (token counters, no model names) describe the run.
 
@@ -2983,8 +2994,9 @@ class FotoHub(_BaseClient):
             aspect: "16:9", "9:16", "1:1" or "4:5"; default the project's aspect.
             ai_budget_usd: Cap for AI-generated media, 0-50 (0 = stock and
                 existing media only).
-            auto_apply: Commit the result; if false it stays a draft for about
-                30 minutes, to commit with :meth:`apply_video_auto_edit`.
+            auto_apply: Commit the result; if false it stays a draft (30
+                minutes, at most 60 minutes from the start), to commit with
+                :meth:`apply_video_auto_edit`.
             mode: "auto_edit" or "cut" (proposes a cut from ``brief``).
             brief: Required for ``mode="cut"``: the cut brief (profile,
                 targetTicks, pacing, order, ...).
@@ -3023,6 +3035,10 @@ class FotoHub(_BaseClient):
             expected_save_rev: The ``saveRev`` you last read; if the project
                 changed since, nothing is written and
                 :class:`~fotohub.SaveConflictError` is raised (the draft stays).
+                To apply a draft after a ``save-conflict``, pass the error's
+                ``current_save_rev``: the service then REBASES the draft onto the
+                current project (409 ``rebase-conflict`` when it cannot be
+                replayed). Omitting it on such a draft is a 422.
             idempotency_key: Override the automatic ``X-Idempotency-Key``.
 
         Returns:
@@ -5128,7 +5144,7 @@ class AsyncFotoHub(_BaseClient):
         label: Optional[str] = None,
         note: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Apply up to 40 editing operations to a project as one atomic batch. Free.
+        """Apply up to 40 editing operations to a project in one request. Free.
 
         The operation shapes are listed by :meth:`get_video_ops_catalog`. If any
         operation is rejected it is skipped and reported in ``results`` (see
@@ -5217,10 +5233,8 @@ class AsyncFotoHub(_BaseClient):
                 "warning") and/or "info" (one string or a list).
 
         Returns:
-            :class:`~fotohub.models.LintResult` dict. While the checker is not
-            deployed the call still succeeds, with ``available: False`` and
-            ``warnings: ["lint-unavailable"]``. A 501 ``lint-unavailable`` error
-            means the whole endpoint is missing.
+            :class:`~fotohub.models.LintResult` dict: ``findings`` and their
+            ``counts``.
         """
         body = _drop_none({
             "rules": rules,
@@ -5359,8 +5373,13 @@ class AsyncFotoHub(_BaseClient):
     ) -> dict[str, Any]:
         """Let FOTOhub edit the project for you (server-side Auto-Edit). Paid.
 
-        A base fee is charged up front, plus the AI usage of the run once it
-        finishes. The call returns the running job (202); follow it with
+        ONE base fee per run is charged up front; it covers the AI assistant's
+        work (AI tokens are not billed separately). Media the run generates
+        is billed per item. A failed run is refunded. A run that ends in
+        ``save-conflict`` keeps its draft and can still be applied (see
+        :meth:`apply_video_auto_edit`) within about 70 minutes of the run
+        start, otherwise it is refunded. An applied run is never refunded.
+        The call returns the running job (202); follow it with
         :meth:`get_video_job` / ``wait``: ``stages``, ``report`` and ``usage``
         (token counters, no model names) describe the run.
 
@@ -5376,8 +5395,9 @@ class AsyncFotoHub(_BaseClient):
             aspect: "16:9", "9:16", "1:1" or "4:5"; default the project's aspect.
             ai_budget_usd: Cap for AI-generated media, 0-50 (0 = stock and
                 existing media only).
-            auto_apply: Commit the result; if false it stays a draft for about
-                30 minutes, to commit with :meth:`apply_video_auto_edit`.
+            auto_apply: Commit the result; if false it stays a draft (30
+                minutes, at most 60 minutes from the start), to commit with
+                :meth:`apply_video_auto_edit`.
             mode: "auto_edit" or "cut" (proposes a cut from ``brief``).
             brief: Required for ``mode="cut"``: the cut brief (profile,
                 targetTicks, pacing, order, ...).
@@ -5416,6 +5436,10 @@ class AsyncFotoHub(_BaseClient):
             expected_save_rev: The ``saveRev`` you last read; if the project
                 changed since, nothing is written and
                 :class:`~fotohub.SaveConflictError` is raised (the draft stays).
+                To apply a draft after a ``save-conflict``, pass the error's
+                ``current_save_rev``: the service then REBASES the draft onto the
+                current project (409 ``rebase-conflict`` when it cannot be
+                replayed). Omitting it on such a draft is a 422.
             idempotency_key: Override the automatic ``X-Idempotency-Key``.
 
         Returns:

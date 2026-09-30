@@ -344,10 +344,11 @@ class ApplyOpsResult(TypedDict, total=False):
     """Result of ``apply_video_ops``.
 
     A rejected operation is skipped and reported in ``results`` (``accepted`` /
-    ``rejected``). ``ok`` is False and ``rolledBack`` True only when the final
-    document would violate the timeline invariants: the whole batch is then
+    ``rejected``). ``ok`` is False when no operation was accepted (nothing to
+    save) and when the final document would violate the timeline invariants;
+    only the latter sets ``rolledBack`` True: the whole batch is then
     discarded, the project and ``saveRev`` are unchanged, and ``violations``
-    says why. That is a normal answer (HTTP 200), not an exception.
+    says why. Both are normal answers (HTTP 200), not exceptions.
     """
 
     ok: bool
@@ -401,7 +402,7 @@ class LintResult(TypedDict, total=False):
     saveRev: int
     findings: list[LintFinding]
     counts: LintCounts
-    #: False while the checker is not deployed; ``warnings`` then holds ``lint-unavailable``.
+    #: Whether the checker ran.
     available: bool
     warnings: list[str]
 
@@ -462,7 +463,7 @@ class AutoEditUsage(TypedDict, total=False):
     cacheReadTokens: int
     cacheWriteTokens: int
     outputTokens: int
-    #: True once the AI usage of the finished run has been settled.
+    #: Stays False while the base fee covers the run's AI tokens (the default): tokens are metered, not billed.
     billed: bool
     units: float
     chargedUsd: float

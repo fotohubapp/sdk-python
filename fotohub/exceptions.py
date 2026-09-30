@@ -202,6 +202,10 @@ class VideoJobFailedError(FotoHubError):
     """Raised by ``wait_for_video_job`` when a render/capture job ends ``failed`` or ``cancelled``.
 
     :attr:`refunded` says whether the charge was already returned to your wallet.
+    For a failed Auto-Edit run :attr:`code` and :attr:`reason` are the run's
+    ``error.code``; after a ``save-conflict`` :attr:`current_save_rev` is the
+    project revision now and :attr:`draft_id` the kept draft (apply it with
+    ``apply_video_auto_edit(..., expected_save_rev=current_save_rev)``).
     """
 
     def __init__(
@@ -211,9 +215,13 @@ class VideoJobFailedError(FotoHubError):
         job_id: Optional[str] = None,
         reason: Optional[str] = None,
         refunded: Optional[bool] = None,
+        current_save_rev: Optional[int] = None,
+        draft_id: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(message, **kwargs)
         self.job_id = job_id
         self.reason = reason
         self.refunded = refunded
+        self.current_save_rev = current_save_rev
+        self.draft_id = draft_id
