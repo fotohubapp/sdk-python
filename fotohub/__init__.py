@@ -29,9 +29,11 @@ from .exceptions import (
     InsufficientCreditsError,
     InsufficientFundsError,
     RateLimitError,
+    SaveConflictError,
     ServerError,
     TimeoutError,
     ValidationError,
+    VideoJobFailedError,
     VideoJobTimeoutError,
 )
 from .streaming import AsyncChatStream, ChatStream
@@ -52,6 +54,8 @@ __all__ = [
     "ServerError",
     "TimeoutError",
     "VideoJobTimeoutError",
+    "VideoJobFailedError",
+    "SaveConflictError",
     # Streaming
     "ChatStream",
     "AsyncChatStream",

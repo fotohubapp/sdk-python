@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 import uuid
 import warnings
@@ -19,9 +20,12 @@ from .exceptions import (
     FotoHubError,
     InsufficientFundsError,
     RateLimitError,
+    SaveConflictError,
     ServerError,
     TimeoutError,
     ValidationError,
+    VideoJobFailedError,
+    VideoJobTimeoutError,
 )
 from .streaming import AsyncChatStream, ChatStream
 
@@ -72,6 +76,12 @@ _IDEMPOTENCY_EXCLUDE_PREFIXES: tuple[str, ...] = (
 )
 
 
+#: Timeline POSTs that are free, idempotent by nature and answer 409 for a real
+#: reason (`save-conflict`). A key here would make `_should_retry` treat that 409
+#: as "request in flight" and retry a conflict that can never resolve itself.
+_UNGUARDED_TIMELINE_POST = re.compile(r"^/v1/video/projects/[^/]+/(ops|digest|lint)$")
+
+
 def _idempotency_key_for(method: str, path: str, stream: bool) -> Optional[str]:
     """A fresh key for one logical call, or None if the call is not guarded.
 
@@ -91,6 +101,8 @@ def _idempotency_key_for(method: str, path: str, stream: bool) -> Optional[str]:
     if not path.startswith(_IDEMPOTENT_PREFIXES):
         return None
     if path.startswith(_IDEMPOTENCY_EXCLUDE_PREFIXES):
+        return None
+    if _UNGUARDED_TIMELINE_POST.match(path):
         return None
     return str(uuid.uuid4())
 
@@ -152,8 +164,107 @@ def _extract_error(body: Any, fallback: str) -> tuple[str, dict[str, Any]]:
     message = body.get("error", body.get("message", fallback))
     if isinstance(message, dict):
         # {"error": {"message": ...}} — an upstream provider envelope.
-        return str(message.get("message") or message.get("code") or fallback), message
+        # The public timeline envelope is {"error": {code, message, details?}}: the
+        # structured fields live under `details`, so merge them over the envelope.
+        fields = dict(message)
+        if isinstance(message.get("details"), dict):
+            fields = {**message["details"], **fields}
+        return str(message.get("message") or message.get("code") or fallback), fields
     return str(message), body
+
+
+def _camel(name: str) -> str:
+    head, *rest = name.split("_")
+    return head + "".join(part.capitalize() for part in rest)
+
+
+def _drop_none(data: dict[str, Any]) -> dict[str, Any]:
+    """Omit unset optionals: the API validates strictly and rejects unknown/null shapes."""
+    return {k: v for k, v in data.items() if v is not None}
+
+
+def _video_media_payload(media: Optional[list[dict[str, Any]]]) -> Optional[list[dict[str, Any]]]:
+    """``[{"url"|"storage_path", "kind"?, "name"?}]`` -> the API's camelCase shape."""
+    if media is None:
+        return None
+    return [{_camel(k): v for k, v in item.items() if v is not None} for item in media]
+
+
+def _video_project_payload(**kw: Any) -> dict[str, Any]:
+    template = kw.get("template")
+    return _drop_none({
+        "title": kw.get("title"),
+        "aspect": kw.get("aspect"),
+        "fps": kw.get("fps"),
+        "media": _video_media_payload(kw.get("media")),
+        "template": {"id": template} if isinstance(template, str) else template,
+        "placeMedia": kw.get("place_media"),
+    })
+
+
+def _video_render_payload(**kw: Any) -> dict[str, Any]:
+    span = kw.get("time_range")
+    return _drop_none({
+        "format": kw.get("format"),
+        "codec": kw.get("codec"),
+        "quality": kw.get("quality"),
+        "resolution": kw.get("resolution"),
+        "fps": kw.get("fps"),
+        "bitrate": kw.get("bitrate"),
+        "range": {"in": span[0], "out": span[1]} if span else None,
+        "contentCredentials": kw.get("content_credentials"),
+        "contentAiDeclared": kw.get("content_ai_declared"),
+    })
+
+
+def _video_capture_payload(**kw: Any) -> dict[str, Any]:
+    sheet = kw.get("sheet")
+    return _drop_none({
+        "times": kw.get("times"),
+        "count": kw.get("count"),
+        # `cuts: false` means "not chosen": the API wants exactly one selector.
+        "cuts": True if kw.get("cuts") else None,
+        "width": kw.get("width"),
+        "sheet": {_camel(k): v for k, v in sheet.items()} if sheet else None,
+    })
+
+
+def _video_auto_edit_payload(**kw: Any) -> dict[str, Any]:
+    return _drop_none({
+        "style": kw.get("style"),
+        "toggles": kw.get("toggles"),
+        "language": kw.get("language"),
+        "aspect": kw.get("aspect"),
+        "aiBudgetUsd": kw.get("ai_budget_usd"),
+        "autoApply": kw.get("auto_apply"),
+        "mode": kw.get("mode"),
+    })
+
+
+def _video_source_payload(**kw: Any) -> dict[str, Any]:
+    """Analysis source: either a public ``url`` or a project's ``project_id`` + ``media_id``."""
+    return _drop_none({
+        "url": kw.get("url"),
+        "projectId": kw.get("project_id"),
+        "mediaId": kw.get("media_id"),
+    })
+
+
+#: Statuses after which a render/capture job will not change again.
+_VIDEO_JOB_FAILED = ("failed", "cancelled")
+
+
+def _video_job_failure(job: dict[str, Any]) -> VideoJobFailedError:
+    job_id = job.get("jobId")
+    reason = job.get("reason")
+    detail = job.get("error") or reason or job.get("status")
+    return VideoJobFailedError(
+        message=f"Video job {job_id} {job.get('status')}: {detail}",
+        job_id=job_id,
+        reason=reason,
+        refunded=job.get("refunded"),
+        response_body=job,
+    )
 
 
 def _seedance_payload(**kwargs: Any) -> dict[str, Any]:
@@ -220,7 +331,23 @@ class _BaseClient:
         return headers
 
     def _handle_error_response(self, response: httpx.Response) -> None:
-        """Raise appropriate exception based on HTTP status code."""
+        """Raise appropriate exception based on HTTP status code.
+
+        Whatever is raised also carries ``code`` / ``details`` when the body is
+        the ``{"error": {"code", "message", "details"}}`` envelope.
+        """
+        try:
+            self._raise_for_status(response)
+        except FotoHubError as exc:
+            body = exc.response_body
+            envelope = body.get("error") if isinstance(body, dict) else None
+            if isinstance(envelope, dict):
+                if isinstance(envelope.get("code"), str):
+                    exc.code = envelope["code"]
+                exc.details = envelope.get("details")
+            raise
+
+    def _raise_for_status(self, response: httpx.Response) -> None:
         status = response.status_code
         try:
             body = response.json()
@@ -229,6 +356,14 @@ class _BaseClient:
 
         message, fields = _extract_error(body, response.text)
 
+        if status == 409 and fields.get("code") == "save-conflict":
+            rev = fields.get("currentSaveRev")
+            raise SaveConflictError(
+                message=message,
+                status_code=status,
+                response_body=body,
+                current_save_rev=int(rev) if isinstance(rev, (int, float)) and not isinstance(rev, bool) else None,
+            )
         if status == 401 or status == 403:
             raise AuthError(message=message, status_code=status, response_body=body)
         elif status == 402:
@@ -251,7 +386,11 @@ class _BaseClient:
                 credits_available=_as_float(fields.get("credits_available")),
             )
         elif status == 429:
-            retry_after = response.headers.get("retry-after") or fields.get("retry_after")
+            retry_after = (
+                response.headers.get("retry-after")
+                or fields.get("retry_after")
+                or fields.get("retryAfter")
+            )
             raise RateLimitError(
                 message=message,
                 status_code=status,
@@ -329,6 +468,7 @@ class FotoHub(_BaseClient):
         json_data: Optional[dict[str, Any]] = None,
         params: Optional[dict[str, Any]] = None,
         stream: bool = False,
+        idempotency_key: Optional[str] = None,
     ) -> httpx.Response:
         """Make an HTTP request with retry logic.
 
@@ -337,7 +477,7 @@ class FotoHub(_BaseClient):
         replayed rather than charged again. See `_idempotency_key_for`.
         """
         last_exception: Optional[Exception] = None
-        idem_key = _idempotency_key_for(method, path, stream)
+        idem_key = idempotency_key or _idempotency_key_for(method, path, stream)
         extra_headers = {IDEMPOTENCY_HEADER: idem_key} if idem_key else None
 
         for attempt in range(self.max_retries):
@@ -2439,6 +2579,506 @@ class FotoHub(_BaseClient):
         )
 
     # =========================================================================
+    # Video timeline (headless editor API: /v1/video/projects)
+    # =========================================================================
+
+    def create_video_project(
+        self,
+        *,
+        title: Optional[str] = None,
+        aspect: Optional[str] = None,
+        fps: Optional[int] = None,
+        media: Optional[list[dict[str, Any]]] = None,
+        template: Optional[Union[str, dict[str, Any]]] = None,
+        place_media: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create a timeline project, optionally seeded with media. Free.
+
+        The project uses the same document as the FOTOhub video editor, so the
+        result opens in the browser at ``editorUrl``.
+
+        Args:
+            title: Project title.
+            aspect: "16:9", "9:16", "1:1", "4:5" or "4:3".
+            fps: Frames per second.
+            media: Up to 50 items, each ``{"url": "https://..."}`` (public HTTPS;
+                FOTOhub copies the file into your storage) or
+                ``{"storage_path": "<bucket>/<userId>/..."}``, plus optional
+                ``kind`` ("video", "audio", "image") and ``name``.
+            template: A template id (or ``{"id": ...}``) to start from.
+            place_media: "sequence" (default) lays the media on the timeline one
+                after another; "none" only adds them to the project.
+            idempotency_key: Override the automatic ``X-Idempotency-Key``. Retrying
+                with the same key within 24 h returns the first project instead
+                of creating a second one.
+
+        Returns:
+            :class:`~fotohub.models.VideoProject` dict: ``projectId``, ``saveRev``,
+            ``digest``, ``media``, ``unplacedMedia`` (media that did not fit on the
+            timeline) and ``editorUrl``.
+
+        Raises:
+            FotoHubError: ``code`` is ``media-blocked`` (URL not allowed),
+                ``media-too-large`` or ``media-not-found``.
+        """
+        response = self._request(
+            "POST", "/v1/video/projects",
+            json_data=_video_project_payload(
+                title=title, aspect=aspect, fps=fps, media=media,
+                template=template, place_media=place_media,
+            ),
+            idempotency_key=idempotency_key,
+        )
+        return response.json()
+
+    def list_video_projects(self, *, limit: int = 50) -> dict[str, Any]:
+        """List your API-created video projects (newest first). Free.
+
+        Returns:
+            Dict with ``projects``: ``[{projectId, title, updatedAt, editorUrl}]``.
+        """
+        response = self._request("GET", "/v1/video/projects", params={"limit": limit})
+        return response.json()
+
+    def get_video_project(
+        self, project_id: str, *, include_doc: bool = False
+    ) -> dict[str, Any]:
+        """Fetch a project: digest, media (with fresh URLs), versions and ``saveRev``. Free.
+
+        Args:
+            project_id: The ``projectId`` from :meth:`create_video_project`.
+            include_doc: Also return the full editor document as ``doc``.
+
+        Returns:
+            :class:`~fotohub.models.VideoProject` dict. A project that is not
+            yours is reported as not found (HTTP 404), never as forbidden.
+        """
+        response = self._request(
+            "GET", f"/v1/video/projects/{project_id}",
+            params={"include": "doc"} if include_doc else None,
+        )
+        return response.json()
+
+    def delete_video_project(self, project_id: str) -> dict[str, Any]:
+        """Delete an API-created project. Free.
+
+        Args:
+            project_id: The ``projectId`` to delete.
+        """
+        response = self._request("DELETE", f"/v1/video/projects/{project_id}")
+        return response.json()
+
+    def apply_video_ops(
+        self,
+        project_id: str,
+        ops: list[dict[str, Any]],
+        *,
+        dry_run: bool = False,
+        expected_save_rev: Optional[int] = None,
+        label: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Apply up to 40 editing operations to a project as one atomic batch. Free.
+
+        The operation shapes are listed by :meth:`get_video_ops_catalog`. If any
+        operation is rejected the whole batch is rolled back: the project is
+        unchanged and the result has ``rolledBack: True`` with ``violations``
+        (HTTP 200, not an exception).
+
+        Args:
+            project_id: The project to edit.
+            ops: Operation objects, e.g. ``{"type": "addClip", ...}``.
+            dry_run: Validate and preview the effect without saving.
+            expected_save_rev: The ``saveRev`` you last read. If the project
+                changed since (the browser editor, another agent), nothing is
+                written and :class:`~fotohub.SaveConflictError` is raised.
+            label: Name for the version snapshot saved with this change.
+
+        Returns:
+            :class:`~fotohub.models.ApplyOpsResult` dict: ``ok``, ``rolledBack``,
+            ``violations``, the new ``saveRev``, ``digestDelta``, ``versionSaved``
+            and ``warnings``.
+
+        Raises:
+            SaveConflictError: 409 ``save-conflict``; re-read the project
+                (``current_save_rev``) and re-apply.
+            ValidationError: 422 ``invalid-ops`` (schema path in ``details``).
+        """
+        body = _drop_none({
+            "ops": ops,
+            "dryRun": True if dry_run else None,
+            "expectedSaveRev": expected_save_rev,
+            "label": label,
+        })
+        response = self._request(
+            "POST", f"/v1/video/projects/{project_id}/ops", json_data=body
+        )
+        return response.json()
+
+    def digest_video_project(
+        self,
+        project_id: str,
+        *,
+        clip_ids: Optional[list[str]] = None,
+        view: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Read the project digest, or detailed data for up to 10 clips. Free.
+
+        Args:
+            project_id: The project to read.
+            clip_ids: Return details for these clips (max 10).
+            view: "digest" or "clips".
+        """
+        body = _drop_none({"clipIds": clip_ids, "view": view})
+        response = self._request(
+            "POST", f"/v1/video/projects/{project_id}/digest", json_data=body
+        )
+        return response.json()
+
+    def lint_video_project(
+        self,
+        project_id: str,
+        *,
+        rules: Optional[list[str]] = None,
+        severity: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Check a project for editing problems (gaps, clipping, overlaps, ...). Free.
+
+        Args:
+            project_id: The project to check.
+            rules: Only run these rule ids.
+            severity: Minimum severity to report: "error", "warn" or "info".
+
+        Returns:
+            :class:`~fotohub.models.LintResult` dict. ``code`` is
+            ``lint-unavailable`` (HTTP 501) while the checker is not deployed.
+        """
+        body = _drop_none({"rules": rules, "severity": severity})
+        response = self._request(
+            "POST", f"/v1/video/projects/{project_id}/lint", json_data=body
+        )
+        return response.json()
+
+    def capture_video_project(
+        self,
+        project_id: str,
+        *,
+        times: Optional[list[float]] = None,
+        count: Optional[int] = None,
+        cuts: bool = False,
+        width: Optional[int] = 640,
+        sheet: Optional[dict[str, int]] = None,
+        wait: bool = False,
+        max_wait: float = 300.0,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Render still frames of the timeline into contact sheets, to see the edit. Paid, flat fee.
+
+        Give exactly one of ``times``, ``count`` or ``cuts=True``.
+
+        Args:
+            project_id: The project to capture.
+            times: Timeline positions in seconds (up to 24).
+            count: That many frames spread evenly over the timeline.
+            cuts: One frame at every cut.
+            width: Frame width in pixels (16-1280, default 640).
+            sheet: Contact sheet layout ``{"max_cells": 1-12, "max_edge": 256-1568}``.
+            wait: Poll until the job finishes and return it (see
+                :meth:`wait_for_video_job`).
+            max_wait: Seconds to wait when ``wait`` is true.
+            idempotency_key: Override the automatic ``X-Idempotency-Key``.
+
+        Returns:
+            Without ``wait``: a queued :class:`~fotohub.models.VideoJob`
+            (``jobId``, ``status``, ``times``, ``width``, ``height``). With
+            ``wait``: the completed job, carrying a
+            :class:`~fotohub.models.CaptureResult` (``frames``, ``sheets``,
+            ``missing``).
+
+        Raises:
+            RateLimitError: 429 ``rate-limited`` with ``retry_after``.
+            AuthError: 403 ``payment-required`` when the wallet is empty.
+        """
+        response = self._request(
+            "POST", f"/v1/video/projects/{project_id}/capture",
+            json_data=_video_capture_payload(
+                times=times, count=count, cuts=cuts, width=width, sheet=sheet
+            ),
+            idempotency_key=idempotency_key,
+        )
+        job = response.json()
+        return self.wait_for_video_job(job["jobId"], timeout=max_wait) if wait else job
+
+    def render_video_project(
+        self,
+        project_id: str,
+        *,
+        format: str = "mp4",
+        quality: str = "high",
+        resolution: Optional[str] = None,
+        codec: Optional[str] = None,
+        fps: Optional[int] = None,
+        bitrate: Optional[str] = None,
+        time_range: Optional[tuple[float, float]] = None,
+        content_credentials: Optional[bool] = None,
+        content_ai_declared: Optional[bool] = None,
+        wait: bool = False,
+        max_wait: float = 1800.0,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Render the project to a video file. Paid per output minute.
+
+        The charge is returned automatically if the render fails.
+
+        Args:
+            project_id: The project to render.
+            format: "mp4", "webm", "mov", "gif", "mp3" or "wav".
+            quality: "draft", "standard", "high" or "ultra".
+            resolution: "720p", "1080p", "2k" or "4k".
+            codec: "h264", "h265" or "prores".
+            fps: Output frame rate (1-120).
+            bitrate: e.g. "8M" or "800k".
+            time_range: Render only ``(start, end)`` seconds of the timeline.
+            content_credentials: Embed C2PA content credentials.
+            content_ai_declared: Declare AI-generated content in them.
+            wait: Poll until the render finishes and return the completed job.
+            max_wait: Seconds to wait when ``wait`` is true (default 1800).
+            idempotency_key: Override the automatic ``X-Idempotency-Key``.
+
+        Returns:
+            Without ``wait``: a queued :class:`~fotohub.models.VideoJob`
+            (``jobId``, ``billedMinutes``). With ``wait``: the completed job with
+            ``outputUrl``.
+
+        Raises:
+            VideoJobFailedError: With ``wait``, if the render fails (``refunded``
+                tells whether the charge was returned).
+            VideoJobTimeoutError: With ``wait``, if ``max_wait`` elapses; the job
+                keeps running, poll it with :meth:`get_video_job`.
+        """
+        response = self._request(
+            "POST", f"/v1/video/projects/{project_id}/render",
+            json_data=_video_render_payload(
+                format=format, quality=quality, resolution=resolution, codec=codec,
+                fps=fps, bitrate=bitrate, time_range=time_range,
+                content_credentials=content_credentials,
+                content_ai_declared=content_ai_declared,
+            ),
+            idempotency_key=idempotency_key,
+        )
+        job = response.json()
+        return self.wait_for_video_job(job["jobId"], timeout=max_wait) if wait else job
+
+    def auto_edit_video_project(
+        self,
+        project_id: str,
+        *,
+        style: Optional[str] = None,
+        toggles: Optional[dict[str, Any]] = None,
+        language: Optional[str] = None,
+        aspect: Optional[str] = None,
+        ai_budget_usd: float = 0,
+        auto_apply: bool = True,
+        mode: str = "auto_edit",
+        wait: bool = False,
+        max_wait: float = 1800.0,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Let FOTOhub edit the project for you (server-side Auto-Edit). Paid.
+
+        Args:
+            project_id: The project to edit.
+            style: "viral", "podcast", "explainer", "storytelling" or "captions-only".
+            toggles: Feature switches, as in the editor's Auto-Edit panel.
+            language: Spoken language ("auto" to detect).
+            aspect: Target aspect ratio.
+            ai_budget_usd: Cap for AI-generated media, 0-50 (0 = stock only).
+            auto_apply: Commit the result; if false it stays a draft.
+            mode: "auto_edit" or "cut".
+            wait: Poll until finished and return the completed job (with ``report``).
+            max_wait: Seconds to wait when ``wait`` is true.
+            idempotency_key: Override the automatic ``X-Idempotency-Key``.
+
+        Returns:
+            A queued :class:`~fotohub.models.VideoJob`, or the finished one with ``wait``.
+        """
+        response = self._request(
+            "POST", f"/v1/video/projects/{project_id}/auto-edit",
+            json_data=_video_auto_edit_payload(
+                style=style, toggles=toggles, language=language, aspect=aspect,
+                ai_budget_usd=ai_budget_usd, auto_apply=auto_apply, mode=mode,
+            ),
+            idempotency_key=idempotency_key,
+        )
+        job = response.json()
+        return self.wait_for_video_job(job["jobId"], timeout=max_wait) if wait else job
+
+    def get_video_job(self, job_id: str) -> dict[str, Any]:
+        """Read the state of a render / capture / auto-edit job. Free.
+
+        Returns:
+            :class:`~fotohub.models.VideoJob` dict. ``status`` is "queued",
+            "running", "completed", "failed" or "cancelled"; a failed job carries
+            ``error`` and ``refunded``.
+        """
+        response = self._request("GET", f"/v1/video/jobs/{job_id}")
+        return response.json()
+
+    def wait_for_video_job(
+        self,
+        job_id: str,
+        *,
+        poll_interval: float = 3.0,
+        timeout: float = 1800.0,
+    ) -> dict[str, Any]:
+        """Poll a render / capture / auto-edit job until it completes.
+
+        Args:
+            job_id: The ``jobId`` returned by the render, capture or auto-edit call.
+            poll_interval: Seconds between checks (default 3.0).
+            timeout: Maximum wait in seconds (default 1800.0).
+
+        Returns:
+            The completed :class:`~fotohub.models.VideoJob`.
+
+        Raises:
+            VideoJobFailedError: The job ended "failed" or "cancelled".
+            VideoJobTimeoutError: ``timeout`` elapsed first (the job may still finish).
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            job = self.get_video_job(job_id)
+            status = job.get("status")
+            if status == "completed":
+                return job
+            if status in _VIDEO_JOB_FAILED:
+                raise _video_job_failure(job)
+            if time.monotonic() + poll_interval > deadline:
+                raise VideoJobTimeoutError(
+                    message=f"Video job {job_id} not finished after {timeout}s (last status: {status})",
+                    job_id=job_id,
+                )
+            time.sleep(poll_interval)
+
+    def get_video_ops_catalog(self) -> dict[str, Any]:
+        """The JSON schema of every operation :meth:`apply_video_ops` accepts. Free."""
+        response = self._request("GET", "/v1/video/ops/catalog")
+        return response.json()
+
+    def detect_video_scenes(
+        self,
+        *,
+        url: Optional[str] = None,
+        project_id: Optional[str] = None,
+        media_id: Optional[str] = None,
+        threshold: float = 0.4,
+        min_scene_duration: float = 0.5,
+    ) -> dict[str, Any]:
+        """Find scene cuts in a video. Paid per request.
+
+        Give either ``url`` (public HTTPS) or ``project_id`` + ``media_id``
+        (an ``assetId`` from the project's media).
+
+        Args:
+            url: Public HTTPS URL of the video.
+            project_id: Project holding the media.
+            media_id: ``assetId`` of the project media item.
+            threshold: Cut sensitivity 0-1 (default 0.4).
+            min_scene_duration: Shortest scene in seconds (default 0.5).
+        """
+        body = {
+            **_video_source_payload(url=url, project_id=project_id, media_id=media_id),
+            "threshold": threshold,
+            "minSceneDuration": min_scene_duration,
+        }
+        response = self._request("POST", "/v1/video/detect-scenes", json_data=body)
+        return response.json()
+
+    def detect_video_silence(
+        self,
+        *,
+        url: Optional[str] = None,
+        project_id: Optional[str] = None,
+        media_id: Optional[str] = None,
+        noise_floor_db: float = -30.0,
+        min_silence_duration: float = 0.3,
+    ) -> dict[str, Any]:
+        """Find silent ranges in audio or video. Paid per request.
+
+        Args:
+            url: Public HTTPS URL of the media.
+            project_id: Project holding the media.
+            media_id: ``assetId`` of the project media item.
+            noise_floor_db: Level below which audio counts as silence (default -30).
+            min_silence_duration: Shortest silence in seconds (default 0.3).
+        """
+        body = {
+            **_video_source_payload(url=url, project_id=project_id, media_id=media_id),
+            "noiseFloorDb": noise_floor_db,
+            "minSilenceDuration": min_silence_duration,
+        }
+        response = self._request("POST", "/v1/video/detect-silence", json_data=body)
+        return response.json()
+
+    def detect_video_beats(
+        self,
+        *,
+        url: Optional[str] = None,
+        project_id: Optional[str] = None,
+        media_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Find beats and tempo in audio or video. Paid per request.
+
+        Args:
+            url: Public HTTPS URL of the media.
+            project_id: Project holding the media.
+            media_id: ``assetId`` of the project media item.
+        """
+        body = _video_source_payload(url=url, project_id=project_id, media_id=media_id)
+        response = self._request("POST", "/v1/video/detect-beats", json_data=body)
+        return response.json()
+
+    def transcribe_video(
+        self,
+        *,
+        url: Optional[str] = None,
+        project_id: Optional[str] = None,
+        media_id: Optional[str] = None,
+        language: str = "auto",
+        hotwords: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """Start a transcription job for audio or video. Paid per request.
+
+        Args:
+            url: Public HTTPS URL of the media.
+            project_id: Project holding the media.
+            media_id: ``assetId`` of the project media item.
+            language: Language code, or "auto" (default).
+            hotwords: Up to 50 words/names to favour.
+
+        Returns:
+            Dict with the transcription ``jobId``; read it with
+            :meth:`get_video_transcription`.
+        """
+        body = {
+            **_video_source_payload(url=url, project_id=project_id, media_id=media_id),
+            "language": language,
+            **_drop_none({"hotwords": hotwords}),
+        }
+        response = self._request("POST", "/v1/video/transcribe", json_data=body)
+        return response.json()
+
+    def get_video_transcription(self, job_id: str) -> dict[str, Any]:
+        """Read a transcription job started by :meth:`transcribe_video`. Free.
+
+        Returns:
+            Dict with ``status`` ("queued", "processing", "completed", "failed"),
+            ``progress`` and, when completed, ``result``.
+        """
+        response = self._request("GET", f"/v1/video/transcribe/{job_id}")
+        return response.json()
+
+    # =========================================================================
     # Lifecycle
     # =========================================================================
 
@@ -2493,6 +3133,7 @@ class AsyncFotoHub(_BaseClient):
         json_data: Optional[dict[str, Any]] = None,
         params: Optional[dict[str, Any]] = None,
         stream: bool = False,
+        idempotency_key: Optional[str] = None,
     ) -> httpx.Response:
         """Make an async HTTP request with retry logic.
 
@@ -2502,7 +3143,7 @@ class AsyncFotoHub(_BaseClient):
         import asyncio
 
         last_exception: Optional[Exception] = None
-        idem_key = _idempotency_key_for(method, path, stream)
+        idem_key = idempotency_key or _idempotency_key_for(method, path, stream)
         extra_headers = {IDEMPOTENCY_HEADER: idem_key} if idem_key else None
 
         for attempt in range(self.max_retries):
@@ -4248,6 +4889,506 @@ class AsyncFotoHub(_BaseClient):
             "polls for you. Pass the dict it returned (or just read its "
             "'video_url')."
         )
+
+    # =========================================================================
+    # Video timeline (headless editor API: /v1/video/projects)
+    # =========================================================================
+
+    async def create_video_project(
+        self,
+        *,
+        title: Optional[str] = None,
+        aspect: Optional[str] = None,
+        fps: Optional[int] = None,
+        media: Optional[list[dict[str, Any]]] = None,
+        template: Optional[Union[str, dict[str, Any]]] = None,
+        place_media: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create a timeline project, optionally seeded with media. Free.
+
+        The project uses the same document as the FOTOhub video editor, so the
+        result opens in the browser at ``editorUrl``.
+
+        Args:
+            title: Project title.
+            aspect: "16:9", "9:16", "1:1", "4:5" or "4:3".
+            fps: Frames per second.
+            media: Up to 50 items, each ``{"url": "https://..."}`` (public HTTPS;
+                FOTOhub copies the file into your storage) or
+                ``{"storage_path": "<bucket>/<userId>/..."}``, plus optional
+                ``kind`` ("video", "audio", "image") and ``name``.
+            template: A template id (or ``{"id": ...}``) to start from.
+            place_media: "sequence" (default) lays the media on the timeline one
+                after another; "none" only adds them to the project.
+            idempotency_key: Override the automatic ``X-Idempotency-Key``. Retrying
+                with the same key within 24 h returns the first project instead
+                of creating a second one.
+
+        Returns:
+            :class:`~fotohub.models.VideoProject` dict: ``projectId``, ``saveRev``,
+            ``digest``, ``media``, ``unplacedMedia`` (media that did not fit on the
+            timeline) and ``editorUrl``.
+
+        Raises:
+            FotoHubError: ``code`` is ``media-blocked`` (URL not allowed),
+                ``media-too-large`` or ``media-not-found``.
+        """
+        response = await self._request(
+            "POST", "/v1/video/projects",
+            json_data=_video_project_payload(
+                title=title, aspect=aspect, fps=fps, media=media,
+                template=template, place_media=place_media,
+            ),
+            idempotency_key=idempotency_key,
+        )
+        return response.json()
+
+    async def list_video_projects(self, *, limit: int = 50) -> dict[str, Any]:
+        """List your API-created video projects (newest first). Free.
+
+        Returns:
+            Dict with ``projects``: ``[{projectId, title, updatedAt, editorUrl}]``.
+        """
+        response = await self._request("GET", "/v1/video/projects", params={"limit": limit})
+        return response.json()
+
+    async def get_video_project(
+        self, project_id: str, *, include_doc: bool = False
+    ) -> dict[str, Any]:
+        """Fetch a project: digest, media (with fresh URLs), versions and ``saveRev``. Free.
+
+        Args:
+            project_id: The ``projectId`` from :meth:`create_video_project`.
+            include_doc: Also return the full editor document as ``doc``.
+
+        Returns:
+            :class:`~fotohub.models.VideoProject` dict. A project that is not
+            yours is reported as not found (HTTP 404), never as forbidden.
+        """
+        response = await self._request(
+            "GET", f"/v1/video/projects/{project_id}",
+            params={"include": "doc"} if include_doc else None,
+        )
+        return response.json()
+
+    async def delete_video_project(self, project_id: str) -> dict[str, Any]:
+        """Delete an API-created project. Free.
+
+        Args:
+            project_id: The ``projectId`` to delete.
+        """
+        response = await self._request("DELETE", f"/v1/video/projects/{project_id}")
+        return response.json()
+
+    async def apply_video_ops(
+        self,
+        project_id: str,
+        ops: list[dict[str, Any]],
+        *,
+        dry_run: bool = False,
+        expected_save_rev: Optional[int] = None,
+        label: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Apply up to 40 editing operations to a project as one atomic batch. Free.
+
+        The operation shapes are listed by :meth:`get_video_ops_catalog`. If any
+        operation is rejected the whole batch is rolled back: the project is
+        unchanged and the result has ``rolledBack: True`` with ``violations``
+        (HTTP 200, not an exception).
+
+        Args:
+            project_id: The project to edit.
+            ops: Operation objects, e.g. ``{"type": "addClip", ...}``.
+            dry_run: Validate and preview the effect without saving.
+            expected_save_rev: The ``saveRev`` you last read. If the project
+                changed since (the browser editor, another agent), nothing is
+                written and :class:`~fotohub.SaveConflictError` is raised.
+            label: Name for the version snapshot saved with this change.
+
+        Returns:
+            :class:`~fotohub.models.ApplyOpsResult` dict: ``ok``, ``rolledBack``,
+            ``violations``, the new ``saveRev``, ``digestDelta``, ``versionSaved``
+            and ``warnings``.
+
+        Raises:
+            SaveConflictError: 409 ``save-conflict``; re-read the project
+                (``current_save_rev``) and re-apply.
+            ValidationError: 422 ``invalid-ops`` (schema path in ``details``).
+        """
+        body = _drop_none({
+            "ops": ops,
+            "dryRun": True if dry_run else None,
+            "expectedSaveRev": expected_save_rev,
+            "label": label,
+        })
+        response = await self._request(
+            "POST", f"/v1/video/projects/{project_id}/ops", json_data=body
+        )
+        return response.json()
+
+    async def digest_video_project(
+        self,
+        project_id: str,
+        *,
+        clip_ids: Optional[list[str]] = None,
+        view: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Read the project digest, or detailed data for up to 10 clips. Free.
+
+        Args:
+            project_id: The project to read.
+            clip_ids: Return details for these clips (max 10).
+            view: "digest" or "clips".
+        """
+        body = _drop_none({"clipIds": clip_ids, "view": view})
+        response = await self._request(
+            "POST", f"/v1/video/projects/{project_id}/digest", json_data=body
+        )
+        return response.json()
+
+    async def lint_video_project(
+        self,
+        project_id: str,
+        *,
+        rules: Optional[list[str]] = None,
+        severity: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Check a project for editing problems (gaps, clipping, overlaps, ...). Free.
+
+        Args:
+            project_id: The project to check.
+            rules: Only run these rule ids.
+            severity: Minimum severity to report: "error", "warn" or "info".
+
+        Returns:
+            :class:`~fotohub.models.LintResult` dict. ``code`` is
+            ``lint-unavailable`` (HTTP 501) while the checker is not deployed.
+        """
+        body = _drop_none({"rules": rules, "severity": severity})
+        response = await self._request(
+            "POST", f"/v1/video/projects/{project_id}/lint", json_data=body
+        )
+        return response.json()
+
+    async def capture_video_project(
+        self,
+        project_id: str,
+        *,
+        times: Optional[list[float]] = None,
+        count: Optional[int] = None,
+        cuts: bool = False,
+        width: Optional[int] = 640,
+        sheet: Optional[dict[str, int]] = None,
+        wait: bool = False,
+        max_wait: float = 300.0,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Render still frames of the timeline into contact sheets, to see the edit. Paid, flat fee.
+
+        Give exactly one of ``times``, ``count`` or ``cuts=True``.
+
+        Args:
+            project_id: The project to capture.
+            times: Timeline positions in seconds (up to 24).
+            count: That many frames spread evenly over the timeline.
+            cuts: One frame at every cut.
+            width: Frame width in pixels (16-1280, default 640).
+            sheet: Contact sheet layout ``{"max_cells": 1-12, "max_edge": 256-1568}``.
+            wait: Poll until the job finishes and return it (see
+                :meth:`wait_for_video_job`).
+            max_wait: Seconds to wait when ``wait`` is true.
+            idempotency_key: Override the automatic ``X-Idempotency-Key``.
+
+        Returns:
+            Without ``wait``: a queued :class:`~fotohub.models.VideoJob`
+            (``jobId``, ``status``, ``times``, ``width``, ``height``). With
+            ``wait``: the completed job, carrying a
+            :class:`~fotohub.models.CaptureResult` (``frames``, ``sheets``,
+            ``missing``).
+
+        Raises:
+            RateLimitError: 429 ``rate-limited`` with ``retry_after``.
+            AuthError: 403 ``payment-required`` when the wallet is empty.
+        """
+        response = await self._request(
+            "POST", f"/v1/video/projects/{project_id}/capture",
+            json_data=_video_capture_payload(
+                times=times, count=count, cuts=cuts, width=width, sheet=sheet
+            ),
+            idempotency_key=idempotency_key,
+        )
+        job = response.json()
+        return await self.wait_for_video_job(job["jobId"], timeout=max_wait) if wait else job
+
+    async def render_video_project(
+        self,
+        project_id: str,
+        *,
+        format: str = "mp4",
+        quality: str = "high",
+        resolution: Optional[str] = None,
+        codec: Optional[str] = None,
+        fps: Optional[int] = None,
+        bitrate: Optional[str] = None,
+        time_range: Optional[tuple[float, float]] = None,
+        content_credentials: Optional[bool] = None,
+        content_ai_declared: Optional[bool] = None,
+        wait: bool = False,
+        max_wait: float = 1800.0,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Render the project to a video file. Paid per output minute.
+
+        The charge is returned automatically if the render fails.
+
+        Args:
+            project_id: The project to render.
+            format: "mp4", "webm", "mov", "gif", "mp3" or "wav".
+            quality: "draft", "standard", "high" or "ultra".
+            resolution: "720p", "1080p", "2k" or "4k".
+            codec: "h264", "h265" or "prores".
+            fps: Output frame rate (1-120).
+            bitrate: e.g. "8M" or "800k".
+            time_range: Render only ``(start, end)`` seconds of the timeline.
+            content_credentials: Embed C2PA content credentials.
+            content_ai_declared: Declare AI-generated content in them.
+            wait: Poll until the render finishes and return the completed job.
+            max_wait: Seconds to wait when ``wait`` is true (default 1800).
+            idempotency_key: Override the automatic ``X-Idempotency-Key``.
+
+        Returns:
+            Without ``wait``: a queued :class:`~fotohub.models.VideoJob`
+            (``jobId``, ``billedMinutes``). With ``wait``: the completed job with
+            ``outputUrl``.
+
+        Raises:
+            VideoJobFailedError: With ``wait``, if the render fails (``refunded``
+                tells whether the charge was returned).
+            VideoJobTimeoutError: With ``wait``, if ``max_wait`` elapses; the job
+                keeps running, poll it with :meth:`get_video_job`.
+        """
+        response = await self._request(
+            "POST", f"/v1/video/projects/{project_id}/render",
+            json_data=_video_render_payload(
+                format=format, quality=quality, resolution=resolution, codec=codec,
+                fps=fps, bitrate=bitrate, time_range=time_range,
+                content_credentials=content_credentials,
+                content_ai_declared=content_ai_declared,
+            ),
+            idempotency_key=idempotency_key,
+        )
+        job = response.json()
+        return await self.wait_for_video_job(job["jobId"], timeout=max_wait) if wait else job
+
+    async def auto_edit_video_project(
+        self,
+        project_id: str,
+        *,
+        style: Optional[str] = None,
+        toggles: Optional[dict[str, Any]] = None,
+        language: Optional[str] = None,
+        aspect: Optional[str] = None,
+        ai_budget_usd: float = 0,
+        auto_apply: bool = True,
+        mode: str = "auto_edit",
+        wait: bool = False,
+        max_wait: float = 1800.0,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Let FOTOhub edit the project for you (server-side Auto-Edit). Paid.
+
+        Args:
+            project_id: The project to edit.
+            style: "viral", "podcast", "explainer", "storytelling" or "captions-only".
+            toggles: Feature switches, as in the editor's Auto-Edit panel.
+            language: Spoken language ("auto" to detect).
+            aspect: Target aspect ratio.
+            ai_budget_usd: Cap for AI-generated media, 0-50 (0 = stock only).
+            auto_apply: Commit the result; if false it stays a draft.
+            mode: "auto_edit" or "cut".
+            wait: Poll until finished and return the completed job (with ``report``).
+            max_wait: Seconds to wait when ``wait`` is true.
+            idempotency_key: Override the automatic ``X-Idempotency-Key``.
+
+        Returns:
+            A queued :class:`~fotohub.models.VideoJob`, or the finished one with ``wait``.
+        """
+        response = await self._request(
+            "POST", f"/v1/video/projects/{project_id}/auto-edit",
+            json_data=_video_auto_edit_payload(
+                style=style, toggles=toggles, language=language, aspect=aspect,
+                ai_budget_usd=ai_budget_usd, auto_apply=auto_apply, mode=mode,
+            ),
+            idempotency_key=idempotency_key,
+        )
+        job = response.json()
+        return await self.wait_for_video_job(job["jobId"], timeout=max_wait) if wait else job
+
+    async def get_video_job(self, job_id: str) -> dict[str, Any]:
+        """Read the state of a render / capture / auto-edit job. Free.
+
+        Returns:
+            :class:`~fotohub.models.VideoJob` dict. ``status`` is "queued",
+            "running", "completed", "failed" or "cancelled"; a failed job carries
+            ``error`` and ``refunded``.
+        """
+        response = await self._request("GET", f"/v1/video/jobs/{job_id}")
+        return response.json()
+
+    async def wait_for_video_job(
+        self,
+        job_id: str,
+        *,
+        poll_interval: float = 3.0,
+        timeout: float = 1800.0,
+    ) -> dict[str, Any]:
+        """Poll a render / capture / auto-edit job until it completes.
+
+        Args:
+            job_id: The ``jobId`` returned by the render, capture or auto-edit call.
+            poll_interval: Seconds between checks (default 3.0).
+            timeout: Maximum wait in seconds (default 1800.0).
+
+        Returns:
+            The completed :class:`~fotohub.models.VideoJob`.
+
+        Raises:
+            VideoJobFailedError: The job ended "failed" or "cancelled".
+            VideoJobTimeoutError: ``timeout`` elapsed first (the job may still finish).
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            job = await self.get_video_job(job_id)
+            status = job.get("status")
+            if status == "completed":
+                return job
+            if status in _VIDEO_JOB_FAILED:
+                raise _video_job_failure(job)
+            if time.monotonic() + poll_interval > deadline:
+                raise VideoJobTimeoutError(
+                    message=f"Video job {job_id} not finished after {timeout}s (last status: {status})",
+                    job_id=job_id,
+                )
+            await asyncio.sleep(poll_interval)
+
+    async def get_video_ops_catalog(self) -> dict[str, Any]:
+        """The JSON schema of every operation :meth:`apply_video_ops` accepts. Free."""
+        response = await self._request("GET", "/v1/video/ops/catalog")
+        return response.json()
+
+    async def detect_video_scenes(
+        self,
+        *,
+        url: Optional[str] = None,
+        project_id: Optional[str] = None,
+        media_id: Optional[str] = None,
+        threshold: float = 0.4,
+        min_scene_duration: float = 0.5,
+    ) -> dict[str, Any]:
+        """Find scene cuts in a video. Paid per request.
+
+        Give either ``url`` (public HTTPS) or ``project_id`` + ``media_id``
+        (an ``assetId`` from the project's media).
+
+        Args:
+            url: Public HTTPS URL of the video.
+            project_id: Project holding the media.
+            media_id: ``assetId`` of the project media item.
+            threshold: Cut sensitivity 0-1 (default 0.4).
+            min_scene_duration: Shortest scene in seconds (default 0.5).
+        """
+        body = {
+            **_video_source_payload(url=url, project_id=project_id, media_id=media_id),
+            "threshold": threshold,
+            "minSceneDuration": min_scene_duration,
+        }
+        response = await self._request("POST", "/v1/video/detect-scenes", json_data=body)
+        return response.json()
+
+    async def detect_video_silence(
+        self,
+        *,
+        url: Optional[str] = None,
+        project_id: Optional[str] = None,
+        media_id: Optional[str] = None,
+        noise_floor_db: float = -30.0,
+        min_silence_duration: float = 0.3,
+    ) -> dict[str, Any]:
+        """Find silent ranges in audio or video. Paid per request.
+
+        Args:
+            url: Public HTTPS URL of the media.
+            project_id: Project holding the media.
+            media_id: ``assetId`` of the project media item.
+            noise_floor_db: Level below which audio counts as silence (default -30).
+            min_silence_duration: Shortest silence in seconds (default 0.3).
+        """
+        body = {
+            **_video_source_payload(url=url, project_id=project_id, media_id=media_id),
+            "noiseFloorDb": noise_floor_db,
+            "minSilenceDuration": min_silence_duration,
+        }
+        response = await self._request("POST", "/v1/video/detect-silence", json_data=body)
+        return response.json()
+
+    async def detect_video_beats(
+        self,
+        *,
+        url: Optional[str] = None,
+        project_id: Optional[str] = None,
+        media_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Find beats and tempo in audio or video. Paid per request.
+
+        Args:
+            url: Public HTTPS URL of the media.
+            project_id: Project holding the media.
+            media_id: ``assetId`` of the project media item.
+        """
+        body = _video_source_payload(url=url, project_id=project_id, media_id=media_id)
+        response = await self._request("POST", "/v1/video/detect-beats", json_data=body)
+        return response.json()
+
+    async def transcribe_video(
+        self,
+        *,
+        url: Optional[str] = None,
+        project_id: Optional[str] = None,
+        media_id: Optional[str] = None,
+        language: str = "auto",
+        hotwords: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """Start a transcription job for audio or video. Paid per request.
+
+        Args:
+            url: Public HTTPS URL of the media.
+            project_id: Project holding the media.
+            media_id: ``assetId`` of the project media item.
+            language: Language code, or "auto" (default).
+            hotwords: Up to 50 words/names to favour.
+
+        Returns:
+            Dict with the transcription ``jobId``; read it with
+            :meth:`get_video_transcription`.
+        """
+        body = {
+            **_video_source_payload(url=url, project_id=project_id, media_id=media_id),
+            "language": language,
+            **_drop_none({"hotwords": hotwords}),
+        }
+        response = await self._request("POST", "/v1/video/transcribe", json_data=body)
+        return response.json()
+
+    async def get_video_transcription(self, job_id: str) -> dict[str, Any]:
+        """Read a transcription job started by :meth:`transcribe_video`. Free.
+
+        Returns:
+            Dict with ``status`` ("queued", "processing", "completed", "failed"),
+            ``progress`` and, when completed, ``result``.
+        """
+        response = await self._request("GET", f"/v1/video/transcribe/{job_id}")
+        return response.json()
 
     # =========================================================================
     # Lifecycle

@@ -14,11 +14,18 @@ class FotoHubError(Exception):
         *,
         status_code: Optional[int] = None,
         response_body: Optional[dict[str, Any]] = None,
+        code: Optional[str] = None,
+        details: Optional[Any] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.response_body = response_body
+        #: Machine-readable code from an ``{"error": {"code": ...}}`` envelope
+        #: (e.g. ``save-conflict``, ``media-not-found``, ``rate-limited``), else ``None``.
+        self.code = code
+        #: The envelope's ``details`` (validation paths, ``currentSaveRev``, ...), else ``None``.
+        self.details = details
 
     def __str__(self) -> str:
         parts = [self.message]
@@ -168,3 +175,45 @@ class VideoJobTimeoutError(FotoHubError):
     ) -> None:
         super().__init__(message, **kwargs)
         self.job_id = job_id
+
+
+class SaveConflictError(FotoHubError):
+    """Raised when a video project changed since you read it (409 ``save-conflict``).
+
+    Someone else (the editor in a browser, another agent) saved first, so your
+    ``expected_save_rev`` is stale and **nothing was written**. Re-read the
+    project with ``get_video_project`` and re-apply your operations on top of
+    :attr:`current_save_rev`.
+    """
+
+    def __init__(
+        self,
+        message: str = "The project was modified since you read it.",
+        *,
+        current_save_rev: Optional[int] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message, **kwargs)
+        #: The project's ``saveRev`` at the moment of the conflict.
+        self.current_save_rev = current_save_rev
+
+
+class VideoJobFailedError(FotoHubError):
+    """Raised by ``wait_for_video_job`` when a render/capture job ends ``failed`` or ``cancelled``.
+
+    :attr:`refunded` says whether the charge was already returned to your wallet.
+    """
+
+    def __init__(
+        self,
+        message: str = "Video job failed.",
+        *,
+        job_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        refunded: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self.job_id = job_id
+        self.reason = reason
+        self.refunded = refunded

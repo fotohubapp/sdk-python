@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -286,3 +286,156 @@ class PresignedUrlResponse(BaseModel):
     )
 
     model_config = {"extra": "allow"}
+
+
+# --- Video timeline API (/v1/video/projects) ---
+#
+# Plain TypedDicts, not pydantic models: the timeline methods return the API's
+# JSON untouched (camelCase keys, exactly as documented), and these describe it
+# for type checkers. Keys marked optional are only present in some responses.
+
+
+class VideoProjectMedia(TypedDict, total=False):
+    """One media item attached to a video project."""
+
+    assetId: str
+    kind: str
+    name: str
+    storagePath: str
+    duration: float
+    width: int
+    height: int
+
+
+class UnplacedMedia(TypedDict, total=False):
+    """A media item that was added to the project but not put on the timeline."""
+
+    assetId: str
+    name: str
+    reason: str
+
+
+class VideoProject(TypedDict, total=False):
+    """A timeline project, as returned by create / get / list."""
+
+    projectId: str
+    title: str
+    saveRev: int
+    updatedAt: str
+    ticksPerSecond: int
+    #: Compact, readable summary of the timeline; pass it to the model, not the raw document.
+    digest: dict[str, Any]
+    media: list[VideoProjectMedia]
+    #: Create only: media that could not be placed on the timeline.
+    unplacedMedia: list[UnplacedMedia]
+    versions: list[dict[str, Any]]
+    #: Open the same project in the browser editor.
+    editorUrl: str
+    #: Only with ``include_doc=True``.
+    doc: dict[str, Any]
+
+
+class ApplyOpsResult(TypedDict, total=False):
+    """Result of ``apply_video_ops``.
+
+    ``ok`` is False and ``rolledBack`` True when any operation was rejected: the
+    whole batch is discarded, the project and ``saveRev`` are unchanged, and
+    ``violations`` says why. That is a normal answer (HTTP 200), not an exception.
+    """
+
+    ok: bool
+    rolledBack: bool
+    dryRun: bool
+    violations: list[dict[str, Any]]
+    saveRev: int
+    digestDelta: dict[str, Any]
+    #: False when the automatic version snapshot could not be stored (see ``warnings``).
+    versionSaved: bool
+    warnings: list[str]
+
+
+class LintFinding(TypedDict, total=False):
+    rule: str
+    severity: str
+    message: str
+    clipId: str
+    trackId: str
+    t: float
+
+
+class LintResult(TypedDict, total=False):
+    """Result of ``lint_video_project``."""
+
+    findings: list[LintFinding]
+    summary: dict[str, Any]
+    saveRev: int
+
+
+class CaptureFrame(TypedDict):
+    """One captured frame, located inside a contact sheet."""
+
+    index: int
+    #: Requested time, seconds.
+    t: float
+    #: Time of the frame actually extracted (quantised to 0.25 s).
+    actualT: float
+    label: str
+    #: Index into ``CaptureResult["sheets"]``.
+    sheet: int
+    #: Cell rectangle on the sheet, pixels.
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+class CaptureSheet(TypedDict):
+    url: str
+    width: int
+    height: int
+
+
+class CaptureMissing(TypedDict):
+    index: int
+    t: float
+
+
+class CaptureResult(TypedDict, total=False):
+    """The ``completed`` payload of a capture job (a :class:`VideoJob` with these keys)."""
+
+    frames: list[CaptureFrame]
+    sheets: list[CaptureSheet]
+    #: Requested points the engine could not extract.
+    missing: list[CaptureMissing]
+
+
+class VideoJob(TypedDict, total=False):
+    """A render or capture job: ``POST .../render|capture`` answers 202 with one, ``GET /v1/video/jobs/{id}`` polls it."""
+
+    jobId: str
+    #: ``render`` or ``capture`` (``auto_edit`` once available).
+    kind: str
+    projectId: str
+    #: ``queued``, ``running``, ``completed``, ``failed`` or ``cancelled``.
+    status: str
+    progress: float
+    queuePosition: int
+    #: Render, ``completed``: the finished file.
+    outputUrl: str
+    outputSize: int
+    #: Render: minutes billed for.
+    billedMinutes: float
+    #: ``failed`` / ``cancelled``.
+    error: str
+    reason: str
+    #: True once the charge of a failed job was returned.
+    refunded: bool
+    warnings: list[str]
+    # Capture, ``completed`` (see CaptureResult):
+    saveRev: int
+    times: list[float]
+    width: int
+    height: int
+    frames: list[CaptureFrame]
+    sheets: list[CaptureSheet]
+    missing: list[CaptureMissing]
