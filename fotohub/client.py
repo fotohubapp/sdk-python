@@ -27,6 +27,8 @@ from .exceptions import (
     VideoJobFailedError,
     VideoJobTimeoutError,
 )
+from .aiwave import attach as _attach_aiwave
+from .aiwave import wait_failure as _aiw_failure
 from .streaming import AsyncChatStream, ChatStream
 
 DEFAULT_BASE_URL = "https://apis.fotohub.app"
@@ -43,7 +45,7 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4.6"
 DEFAULT_BEDROCK_MODEL = DEFAULT_CLAUDE_MODEL
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
-SDK_VERSION = "1.11.0"
+SDK_VERSION = "1.12.0"
 
 #: Header the API reads to de-duplicate a retried charged request. The SDK sends
 #: one automatically on every guarded POST — see `_idempotency_key_for`.
@@ -514,6 +516,42 @@ class FotoHub(_BaseClient):
             headers=self._headers(),
             timeout=self.timeout,
         )
+        _attach_aiwave(self)
+
+    def _aiw(
+        self,
+        method: str,
+        path: str,
+        body: Optional[dict[str, Any]] = None,
+        params: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        """One AI Wave request -> parsed JSON (see `fotohub.aiwave`)."""
+        return self._request(method, path, json_data=body, params=params).json()
+
+    def _aiw_wait(
+        self,
+        path: str,
+        job_id: str,
+        terminal: frozenset,
+        poll_interval: float,
+        timeout: float,
+        on_progress: Any,
+        label: str,
+    ) -> Any:
+        """Poll `path` until its status is in `terminal`."""
+        start = time.monotonic()
+        while True:
+            view = self._aiw("GET", path)
+            if on_progress is not None:
+                on_progress(view)
+            if view.get("status") in terminal:
+                failure = _aiw_failure(view, terminal, label, job_id)
+                if failure is not None:
+                    raise failure
+                return view
+            if time.monotonic() - start >= timeout:
+                raise TimeoutError(message=f"{label} {job_id} timed out after {timeout}s")
+            time.sleep(poll_interval)
 
     def _request(
         self,
@@ -3270,6 +3308,42 @@ class AsyncFotoHub(_BaseClient):
             headers=self._headers(),
             timeout=self.timeout,
         )
+        _attach_aiwave(self)
+
+    async def _aiw(
+        self,
+        method: str,
+        path: str,
+        body: Optional[dict[str, Any]] = None,
+        params: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        """One AI Wave request -> parsed JSON (see `fotohub.aiwave`)."""
+        return (await self._request(method, path, json_data=body, params=params)).json()
+
+    async def _aiw_wait(
+        self,
+        path: str,
+        job_id: str,
+        terminal: frozenset,
+        poll_interval: float,
+        timeout: float,
+        on_progress: Any,
+        label: str,
+    ) -> Any:
+        """Poll `path` until its status is in `terminal`."""
+        start = time.monotonic()
+        while True:
+            view = await self._aiw("GET", path)
+            if on_progress is not None:
+                on_progress(view)
+            if view.get("status") in terminal:
+                failure = _aiw_failure(view, terminal, label, job_id)
+                if failure is not None:
+                    raise failure
+                return view
+            if time.monotonic() - start >= timeout:
+                raise TimeoutError(message=f"{label} {job_id} timed out after {timeout}s")
+            await asyncio.sleep(poll_interval)
 
     async def _request(
         self,

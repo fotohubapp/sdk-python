@@ -19,6 +19,7 @@ Async usage::
         print(result["images"][0]["url"])
 """
 
+from .aiwave import Characters, MusicEdit, ProductShot, ProductShotBatches, VideoEdit
 from .client import AsyncFotoHub, FotoHub
 from .exceptions import (
     AuthError,
@@ -38,12 +39,18 @@ from .exceptions import (
 )
 from .streaming import AsyncChatStream, ChatStream
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 
 __all__ = [
     # Clients
     "FotoHub",
     "AsyncFotoHub",
+    # AI Wave 1 namespaces (client.characters, .product_shot, .video_edit, .music_edit)
+    "Characters",
+    "ProductShot",
+    "ProductShotBatches",
+    "VideoEdit",
+    "MusicEdit",
     # Exceptions
     "FotoHubError",
     "AuthError",
