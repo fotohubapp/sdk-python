@@ -841,7 +841,8 @@ class FotoHub(_BaseClient):
             duration: Desired duration in seconds.
             aspect_ratio: Aspect ratio (e.g. "16:9", "9:16", "1:1").
             image_url: Reference image for image-to-video generation.
-            resolution: Output resolution ("720p", "1080p", "4k").
+            resolution: Output resolution ("720p", "1080p", "4k"). ``sora-2-pro`` is
+                1080p-only: it is rendered and billed at 1080p whatever is sent.
             poll_interval: Seconds between polls, for the models that queue.
             timeout: How long to keep polling before giving up. The job itself
                 is unaffected and may still finish.
@@ -3639,7 +3640,8 @@ class AsyncFotoHub(_BaseClient):
             duration: Desired duration in seconds.
             aspect_ratio: Aspect ratio (e.g. "16:9", "9:16", "1:1").
             image_url: Reference image for image-to-video generation.
-            resolution: Output resolution ("720p", "1080p", "4k").
+            resolution: Output resolution ("720p", "1080p", "4k"). ``sora-2-pro`` is
+                1080p-only: it is rendered and billed at 1080p whatever is sent.
             poll_interval: Seconds between polls, for the models that queue.
             timeout: How long to keep polling before giving up. The job itself
                 is unaffected and may still finish.
