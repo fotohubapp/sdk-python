@@ -305,8 +305,9 @@ print(response["credits_used"])
 
 `chat()` accepts exactly four model IDs — `gemini-flash` (default),
 `gemini-pro`, `gpt-4o`, `claude-sonnet`. Anything else is rejected with `400`.
-For premium Claude-class models use `chat_claude()` or `chat_bedrock()`, which
-take a full model ID and a `system=` prompt.
+For premium Claude-class models use `chat_claude()`, which takes a full model ID
+and a `system=` prompt (`chat_bedrock()` is a deprecated alias kept for
+compatibility).
 
 `credits_used` is the authoritative charge; `usage` is passed through from the
 provider and can be `{}`.
@@ -730,7 +731,7 @@ retry with the same id returns the first job and is never billed twice.
 |--------|-------------|
 | `chat(messages, *, model, temperature, max_tokens)` | Chat completion. `stream=True` raises `ValueError` |
 | `chat_claude(messages, *, model, temperature, max_tokens, system)` | Premium Claude-class chat |
-| `chat_bedrock(messages, *, model, temperature, max_tokens, system)` | Chat via Bedrock |
+| `chat_bedrock(messages, *, model, temperature, max_tokens, system)` | Deprecated alias of `chat_claude()` (same `POST /v1/ai/chat/claude` endpoint), kept for compatibility |
 | `analyze_image(image_url, *, features)` | Vision analysis |
 | `enhance_prompt(prompt, *, style)` | Rewrite a prompt for image models |
 | `translate(text, target_language, *, source_language)` | Translate text |

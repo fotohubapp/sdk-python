@@ -45,7 +45,7 @@ DEFAULT_VIDEO_MODEL = "veo-2"
 DEFAULT_SEEDANCE_MODEL = "seedance-2-5"
 DEFAULT_CHAT_MODEL = "gemini-flash"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4.6"
-# Backwards-compat alias — prefer DEFAULT_CLAUDE_MODEL.
+# Kept for compatibility with older releases — prefer DEFAULT_CLAUDE_MODEL.
 DEFAULT_BEDROCK_MODEL = DEFAULT_CLAUDE_MODEL
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
@@ -1614,7 +1614,9 @@ class FotoHub(_BaseClient):
         max_tokens: int = 4096,
         system: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Deprecated alias for :meth:`chat_claude`.
+        """Deprecated alias for :meth:`chat_claude`, kept for compatibility.
+
+        Calls the same FOTOhub AI chat endpoint (``POST /v1/ai/chat/claude``).
 
         .. deprecated:: 1.4.0
             Use :meth:`chat_claude` instead. This method will be removed in a
@@ -4432,7 +4434,9 @@ class AsyncFotoHub(_BaseClient):
         max_tokens: int = 4096,
         system: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Deprecated alias for :meth:`chat_claude`.
+        """Deprecated alias for :meth:`chat_claude`, kept for compatibility.
+
+        Calls the same FOTOhub AI chat endpoint (``POST /v1/ai/chat/claude``).
 
         .. deprecated:: 1.4.0
             Use :meth:`chat_claude` instead. This method will be removed in a
