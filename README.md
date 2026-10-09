@@ -557,6 +557,13 @@ except VideoJobTimeoutError as e:
 | `ServerError` | 5xx | Server-side error |
 | `TimeoutError` | — | Request timed out or connection failed |
 | `VideoJobTimeoutError` | — | Video polling exceeded `max_wait` (legacy — video is synchronous now) |
+| `PriceChangedError` (`FotoHubError`) | 409 `price_changed` | The price moved away from the `quote_credits` you sent. `quoted_credits`, `current_credits`, `billed_seconds` (Upscale Pro video). Nothing charged: re-quote, show, resend |
+| `UrlBlockedError` (`ValidationError`) | 400 `url_blocked` | A URL parameter was refused (public `https://`, port 443, no credentials, public DNS only). `field` names the parameter; `charged` is `False` |
+| `PricingNotConfiguredError` (`ServerError`) | 503 (or 424) `PRICING_NOT_CONFIGURED` | The model has no price configured; refused before any charge and not retried |
+
+Every exception also carries `code` when the server sent one: the `{"error": {"code"}}`
+envelope, or `detail.code` / `detail.error` of a `{"detail": {...}}` body (for example
+`QUEUE_FULL`, `PLAN_REQUIRED`, `MODEL_DISABLED`, `engine_busy`, `pro_limit`).
 
 All exceptions include `status_code` and `response_body` attributes for debugging.
 
@@ -678,9 +685,10 @@ otherwise identical, with one exception: `gabriel_stream()` is sync-only.
 |--------|-------------|
 | `generate_image(prompt, *, model, width, height, aspect_ratio, num_images, negative_prompt, style, seed)` | Generate images from text |
 | `generate_ida_q(prompt, *, aspect_ratio, image_size, num_images, seed, poll_interval, timeout)` | IDA Q 1.0 — submits and polls to completion |
+| `generate_ida_q2(prompt, *, size_tier, preset, aspect_ratio, num_images, transparent, seed, style, palette, layout, job_id, poll_interval, timeout)` | IDA Q Image 2 — submits (202) and polls to completion; `job_id` is the idempotency key (minted when omitted) |
 | `edit_image(image_url, prompt, *, mode, mask_url, model)` | Inpaint, remove background, upscale |
 | `remove_background(image_url)` / `upscale_image(image_url, *, scale)` | `edit_image` convenience wrappers |
-| `generate_video(prompt, *, model, duration, aspect_ratio, image_url, resolution)` | Generate a video — blocks, returns `video_url`. Not for Seedance |
+| `generate_video(prompt, *, model, duration, aspect_ratio, image_url, resolution, mode)` | Generate a video — blocks, returns `video_url`. Not for Seedance. `mode` (Kling V3): `"standard"` 720p or `"pro"` 1080p |
 | `generate_seedance(prompt, *, model, duration, resolution, generate_audio, reference_videos, asset_ids, ...)` | Seedance 4–30s — submits and polls to completion |
 | `register_video_asset(image_url)` | Register a face for Seedance `asset_ids` — free |
 | `generate_music(prompt, *, model, duration, genre, mood, tempo, instrumental)` | Generate music from text |
@@ -691,6 +699,30 @@ otherwise identical, with one exception: `gabriel_stream()` is sync-only.
 | `get_3d_status(file_id)` | Re-sign the download URL of a stored mesh (free) |
 | `tryon(person_image_url, *, garment_image_url, garment_id, category, garments, ...)` | Start a virtual try-on job |
 | `get_tryon_status(job_id)` / `wait_for_tryon(job_id, ...)` | Poll a try-on job |
+
+**Upscale Pro** — `client.upscale_pro` (Professional plan and up)
+
+| Method | Description |
+|--------|-------------|
+| `quote(kind, *, width, height, scale, fps, seconds)` | Free: eligibility, output size, ETA, billed seconds, `credits` |
+| `image(image_url, *, scale, wait, client_ref)` | 4K image upscale: 200 with `result`, or 202 with `job_id` |
+| `video(video_url, *, scale, start_seconds, max_seconds, quote_credits, client_ref)` | Video upscale (202). `quote_credits` = the quote you showed; 409 `PriceChangedError` when the measured file costs more |
+| `jobs(*, active, kind, limit)` / `job(job_id)` / `cancel(job_id)` / `wait_for_job(job_id, ...)` | Job list, status, cancel (refunded), waiter |
+
+The start routes take no idempotency key, so the SDK does not repeat `image` / `video`
+after a 5xx or a read timeout; check `jobs(active=True)` before starting again.
+
+**AI video** — `client.ai_video` (API keys only)
+
+| Method | Description |
+|--------|-------------|
+| `generate(prompt, *, image, duration, resolution, seed, quote_credits, request_id)` | AI Motion video with sound (`fotohub-motion-audio`, 720p, 5 s) |
+| `avatar(portrait, *, consent, mode, audio, script, language, voice_ref, voice_consent, prompt, gesture, seed, quote_credits, request_id)` | Talking-head clip (up to 5 s) from your own portrait; `consent` required |
+| `dub(source, languages, *, source_language, glossary, voice_ref, voice_consent, quote_credits, request_id)` | Dub a video into up to 5 languages (one job each); `quote_credits` is the total |
+| `get(job_id)` / `wait_for_job(job_id, ...)` | Read / wait for a job any of the three returned |
+
+`request_id` is minted when omitted and re-sent unchanged on the SDK's own retries: a
+retry with the same id returns the first job and is never billed twice.
 
 **Language**
 
@@ -788,6 +820,27 @@ mypy fotohub/
 ```
 
 Please ensure all tests pass and type checks are clean before submitting a pull request.
+
+## Changelog
+
+### 1.13.0 (October 2026)
+
+- Typed errors: `PriceChangedError` (409 `price_changed`: `quoted_credits`,
+  `current_credits`, `billed_seconds`), `UrlBlockedError` (400 `url_blocked`, a
+  `ValidationError`: `field`, `charged`), `PricingNotConfiguredError` (503 / 424
+  `PRICING_NOT_CONFIGURED`, a `ServerError`, not retried). Every exception now carries
+  `code` from a `{"detail": {...}}` body too (IDA Q refusals such as `QUEUE_FULL`,
+  `PLAN_REQUIRED`, `MODEL_DISABLED`). A 503 `MODEL_DISABLED` is no longer retried.
+- `generate_video(..., mode="standard" | "pro")` for Kling V3 (720p / 1080p).
+- `client.upscale_pro`: `quote`, `image`, `video` (with `quote_credits`), `jobs`, `job`,
+  `cancel`, `wait_for_job`.
+- `client.ai_video`: `generate`, `avatar`, `dub`, `get`, `wait_for_job`, with
+  `quote_credits` and an automatic `request_id`.
+- `generate_ida_q2(...)`: IDA Q Image 2, submit and poll.
+
+### 1.12.0
+
+- AI Wave 1 namespaces: `characters`, `product_shot`, `video_edit`, `music_edit`.
 
 ## Links
 

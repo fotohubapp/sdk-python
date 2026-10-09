@@ -21,6 +21,7 @@ Async usage::
 
 from .aiwave import Characters, MusicEdit, ProductShot, ProductShotBatches, VideoEdit
 from .client import AsyncFotoHub, FotoHub
+from .media_jobs import AiVideo, UpscalePro
 from .exceptions import (
     AuthError,
     FotoHubError,
@@ -29,17 +30,20 @@ from .exceptions import (
     # `except InsufficientCreditsError` keeps working.
     InsufficientCreditsError,
     InsufficientFundsError,
+    PriceChangedError,
+    PricingNotConfiguredError,
     RateLimitError,
     SaveConflictError,
     ServerError,
     TimeoutError,
+    UrlBlockedError,
     ValidationError,
     VideoJobFailedError,
     VideoJobTimeoutError,
 )
 from .streaming import AsyncChatStream, ChatStream
 
-__version__ = "1.12.0"
+__version__ = "1.13.0"
 
 __all__ = [
     # Clients
@@ -51,6 +55,9 @@ __all__ = [
     "ProductShotBatches",
     "VideoEdit",
     "MusicEdit",
+    # Job namespaces (client.upscale_pro, client.ai_video)
+    "UpscalePro",
+    "AiVideo",
     # Exceptions
     "FotoHubError",
     "AuthError",
@@ -63,6 +70,9 @@ __all__ = [
     "VideoJobTimeoutError",
     "VideoJobFailedError",
     "SaveConflictError",
+    "PriceChangedError",
+    "UrlBlockedError",
+    "PricingNotConfiguredError",
     # Streaming
     "ChatStream",
     "AsyncChatStream",

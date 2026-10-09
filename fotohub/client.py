@@ -19,15 +19,19 @@ from .exceptions import (
     AuthError,
     FotoHubError,
     InsufficientFundsError,
+    PriceChangedError,
+    PricingNotConfiguredError,
     RateLimitError,
     SaveConflictError,
     ServerError,
     TimeoutError,
+    UrlBlockedError,
     ValidationError,
     VideoJobFailedError,
     VideoJobTimeoutError,
 )
 from .aiwave import attach as _attach_aiwave
+from .media_jobs import attach as _attach_media_jobs
 from .aiwave import wait_failure as _aiw_failure
 from .streaming import AsyncChatStream, ChatStream
 
@@ -45,7 +49,7 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4.6"
 DEFAULT_BEDROCK_MODEL = DEFAULT_CLAUDE_MODEL
 DEFAULT_MUSIC_MODEL = "minimax"
 DEFAULT_SPEECH_MODEL = "google"
-SDK_VERSION = "1.12.0"
+SDK_VERSION = "1.13.0"
 
 #: Header the API reads to de-duplicate a retried charged request. The SDK sends
 #: one automatically on every guarded POST — see `_idempotency_key_for`.
@@ -192,6 +196,99 @@ def _extract_error(body: Any, fallback: str) -> tuple[str, dict[str, Any]]:
             fields = {**message["details"], **fields}
         return str(message.get("message") or message.get("code") or fallback), fields
     return str(message), body
+
+
+#: A ``detail.error`` that is a machine code (``price_changed``) rather than a sentence.
+_CODE_LIKE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+
+#: 503 answers that are a decision, not an outage: repeating the call cannot change them.
+_FINAL_503_CODES = frozenset({"PRICING_NOT_CONFIGURED", "MODEL_DISABLED"})
+
+#: The IDA Q Image 2 model id; always asynchronous (202 + poll).
+IDA_Q2_MODEL = "ida-q-image-2"
+
+
+def _detail_code(body: Any) -> Optional[str]:
+    """The machine code of a FastAPI ``{"detail": {...}}`` error, else ``None``.
+
+    api-server sends it two ways: ``detail.code`` (``PRICING_NOT_CONFIGURED``, the IDA Q
+    refusals, whose ``detail.error`` is a sentence) or ``detail.error`` itself
+    (``price_changed``, ``url_blocked``, ``engine_busy``). ``code`` wins when both exist.
+    """
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if not isinstance(detail, dict):
+        return None
+    code = detail.get("code")
+    if isinstance(code, str) and code:
+        return code
+    err = detail.get("error")
+    if isinstance(err, str) and _CODE_LIKE.match(err):
+        return err
+    return None
+
+
+def _response_detail_code(response: httpx.Response) -> Optional[str]:
+    try:
+        return _detail_code(response.json())
+    except Exception:
+        return None
+
+
+def _ida_q2_payload(
+    prompt: str,
+    *,
+    size_tier: str,
+    preset: str,
+    aspect_ratio: str,
+    num_images: int,
+    transparent: Optional[bool],
+    seed: Optional[int],
+    style: Optional[str],
+    palette: Optional[Union[str, list[str]]],
+    layout: Optional[list[dict[str, Any]]],
+    job_id: Optional[str],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "prompt": prompt,
+        "model": IDA_Q2_MODEL,
+        "size_tier": size_tier,
+        "preset": preset,
+        "aspect_ratio": aspect_ratio,
+        "num_images": num_images,
+        # The job id is the job's idempotency key: a retry with the same id is never
+        # charged twice. Minted here so the SDK's own retries reuse it.
+        "job_id": str(job_id) if job_id is not None else str(uuid.uuid4()),
+    }
+    for key, value in (("transparent", transparent), ("seed", seed), ("style", style),
+                       ("palette", palette), ("layout", layout)):
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def _ida_q2_result(job: dict[str, Any], status: dict[str, Any], job_id: str) -> dict[str, Any]:
+    out = {
+        "model": IDA_Q2_MODEL,
+        "job_id": job_id,
+        # Charged at submit; the poll reports job state only, so carry the cost across.
+        "cost_usd": job.get("cost_usd", (job.get("billing") or {}).get("cost_usd")),
+        "currency": "USD",
+        "billing": job.get("billing"),
+        "images": status.get("images", []),
+        "metadata": status.get("metadata"),
+    }
+    if status.get("result") is not None:
+        out["result"] = status["result"]
+    return out
+
+
+def _ida_q2_failure(status: dict[str, Any], job_id: str) -> FotoHubError:
+    state = status.get("status")
+    return FotoHubError(
+        status.get("error") or f"IDA Q Image 2 job {job_id} {state}",
+        code=status.get("error_code") or None,
+        response_body=status,
+    )
 
 
 def _camel(name: str) -> str:
@@ -376,6 +473,8 @@ class _BaseClient:
                 if isinstance(envelope.get("code"), str):
                     exc.code = envelope["code"]
                 exc.details = envelope.get("details")
+            elif exc.code is None:
+                exc.code = _detail_code(body)
             raise
 
     def _raise_for_status(self, response: httpx.Response) -> None:
@@ -386,6 +485,34 @@ class _BaseClient:
             body = {"error": response.text}
 
         message, fields = _extract_error(body, response.text)
+        detail_code = _detail_code(body)
+
+        if status == 409 and detail_code == "price_changed":
+            billed = fields.get("billed_seconds")
+            raise PriceChangedError(
+                message=message,
+                status_code=status,
+                response_body=body,
+                quoted_credits=_as_float(fields.get("quoted_credits")),
+                current_credits=_as_float(fields.get("current_credits")),
+                billed_seconds=int(billed) if isinstance(billed, (int, float)) and not isinstance(billed, bool) else None,
+            )
+        if status == 400 and detail_code in ("url_blocked", "url_not_allowed"):
+            raise UrlBlockedError(
+                message=message,
+                status_code=status,
+                response_body=body,
+                code=detail_code,
+                field=fields.get("field") if isinstance(fields.get("field"), str) else None,
+                charged=fields.get("charged") is True,
+            )
+        if (status >= 500 or status == 424) and (
+            detail_code == "PRICING_NOT_CONFIGURED"
+            # On the video route a refusal further down the pipeline arrives as a 424
+            # whose `detail` is a string with the code inside it.
+            or (status == 424 and "PRICING_NOT_CONFIGURED" in message)
+        ):
+            raise PricingNotConfiguredError(message=message, status_code=status, response_body=body)
 
         if status == 409 and fields.get("code") == "save-conflict":
             rev = fields.get("currentSaveRev")
@@ -478,6 +605,8 @@ class _BaseClient:
             return idempotent and _is_idempotency_in_progress(response)
         if status_code == 429:
             return True
+        if status_code == 503 and _response_detail_code(response) in _FINAL_503_CODES:
+            return False
         return retry_ambiguous and status_code in (500, 502, 503, 504)
 
     def _backoff_delay(self, attempt: int) -> float:
@@ -517,6 +646,7 @@ class FotoHub(_BaseClient):
             timeout=self.timeout,
         )
         _attach_aiwave(self)
+        _attach_media_jobs(self)
 
     def _aiw(
         self,
@@ -524,9 +654,13 @@ class FotoHub(_BaseClient):
         path: str,
         body: Optional[dict[str, Any]] = None,
         params: Optional[dict[str, Any]] = None,
+        *,
+        retry_ambiguous: bool = True,
     ) -> Any:
-        """One AI Wave request -> parsed JSON (see `fotohub.aiwave`)."""
-        return self._request(method, path, json_data=body, params=params).json()
+        """One namespace request -> parsed JSON (see `fotohub.aiwave`, `fotohub.media_jobs`)."""
+        return self._request(
+            method, path, json_data=body, params=params, retry_ambiguous=retry_ambiguous
+        ).json()
 
     def _aiw_wait(
         self,
@@ -777,6 +911,82 @@ class FotoHub(_BaseClient):
 
         raise TimeoutError(message=f"IDA Q 1.0 job {job_id} did not complete within {timeout}s")
 
+    def generate_ida_q2(
+        self,
+        prompt: str,
+        *,
+        size_tier: str = "1K",
+        preset: str = "balanced",
+        aspect_ratio: str = "1:1",
+        num_images: int = 1,
+        transparent: Optional[bool] = None,
+        seed: Optional[int] = None,
+        style: Optional[str] = None,
+        palette: Optional[Union[str, list[str]]] = None,
+        layout: Optional[list[dict[str, Any]]] = None,
+        job_id: Optional[str] = None,
+        poll_interval: float = 5.0,
+        timeout: float = 900.0,
+    ) -> dict[str, Any]:
+        """Generate images with IDA Q Image 2, FOTOhub's proprietary image model, and wait.
+
+        Always asynchronous: the API answers 202 with a ``job_id`` and the job runs in a
+        queue. This method submits and polls ``GET /v1/ai/generate/image/ida-q-image-2/{job_id}``
+        until the job completes. The price depends on ``size_tier`` x ``preset`` (and
+        ``transparent``) times the image count; read it from ``GET /v1/pricing``. The
+        prepaid USD wallet is charged at submit and refunded automatically if the job fails.
+
+        Args:
+            prompt: What to render. Any language.
+            size_tier: ``"1K"`` (default), ``"HD"`` or ``"FULL"``.
+            preset: ``"fast"``, ``"balanced"`` (default) or ``"max"`` (``FULL`` has no ``max``).
+            aspect_ratio: e.g. ``"1:1"`` (default), ``"16:9"``, ``"4:5"``, ``"9:16"``. Not every
+                ratio is offered at every tier; the API answers 422 for an unoffered combination.
+            num_images: 1 up to the cap for the tier and preset (4 at 1K fast/balanced).
+            transparent: Ask for a transparent background (priced separately).
+            seed: Integer seed for reproducibility.
+            style: e.g. ``"photo"``, ``"poster"``, ``"typography"``, ``"illustration"``.
+            palette: A named palette (``"pastel"``, ``"neon"``, ...) or 1-8 ``"#RRGGBB"`` colours.
+            layout: Up to 12 boxes ``{"type": "obj" | "text", "box": {x, y, w, h}, "text"?, "desc"?}``
+                in output pixels.
+            job_id: A UUID that identifies the job. It is the idempotency key: a retry with the
+                same id returns the queued job and is never charged twice. Minted when omitted.
+            poll_interval: Seconds between status checks.
+            timeout: Maximum seconds to wait; the job keeps running when it is exceeded.
+
+        Returns:
+            Dict with ``images``, ``model``, ``job_id``, ``cost_usd``, ``billing`` and, when the
+            job reports them, ``result`` (``seed``, ``width``, ``height``, ...).
+
+        Raises:
+            RateLimitError: ``QUEUE_FULL`` (``retry_after``), ``TOO_MANY_ACTIVE`` or ``DAILY_LIMIT``
+                (``exc.code``). Nothing is charged.
+            AuthError: ``PLAN_REQUIRED``. ServerError: ``MODEL_DISABLED`` or ``TEMPORARY_ERROR``.
+            ValidationError: ``INVALID_REQUEST`` / ``CONTENT_POLICY``.
+            InsufficientFundsError: the wallet cannot cover it.
+            FotoHubError: the job failed (``exc.code`` is the job's ``error_code`` when present).
+            TimeoutError: the job did not finish within ``timeout``.
+        """
+        payload = _ida_q2_payload(
+            prompt, size_tier=size_tier, preset=preset, aspect_ratio=aspect_ratio,
+            num_images=num_images, transparent=transparent, seed=seed, style=style,
+            palette=palette, layout=layout, job_id=job_id,
+        )
+        job = self._request("POST", "/v1/ai/generate/image", json_data=payload).json()
+        jid = str(job.get("job_id") or payload["job_id"])
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = self._request("GET", f"/v1/ai/generate/image/{IDA_Q2_MODEL}/{jid}").json()
+            state = status.get("status")
+            if state == "completed":
+                return _ida_q2_result(job, status, jid)
+            if state in ("failed", "cancelled"):
+                raise _ida_q2_failure(status, jid)
+            time.sleep(poll_interval)
+
+        raise TimeoutError(message=f"IDA Q Image 2 job {jid} did not complete within {timeout}s")
+
     def edit_image(
         self,
         image_url: str,
@@ -820,6 +1030,7 @@ class FotoHub(_BaseClient):
         aspect_ratio: str = "16:9",
         image_url: Optional[str] = None,
         resolution: str = "1080p",
+        mode: Optional[str] = None,
         poll_interval: float = 5.0,
         timeout: float = 900.0,
     ) -> dict[str, Any]:
@@ -843,6 +1054,9 @@ class FotoHub(_BaseClient):
             image_url: Reference image for image-to-video generation.
             resolution: Output resolution ("720p", "1080p", "4k"). ``sora-2-pro`` is
                 1080p-only: it is rendered and billed at 1080p whatever is sent.
+                Ignored by Kling V3 (``kling-v3``, ``kling-v3-omni``), which renders by ``mode``.
+            mode: Kling V3 only: ``"standard"`` (default, 720p) or ``"pro"`` (1080p).
+                Priced per second by mode; ``duration`` snaps to 5 or 10 s. Not sent when None.
             poll_interval: Seconds between polls, for the models that queue.
             timeout: How long to keep polling before giving up. The job itself
                 is unaffected and may still finish.
@@ -868,6 +1082,8 @@ class FotoHub(_BaseClient):
         }
         if image_url is not None:
             payload["image_url"] = image_url
+        if mode is not None:
+            payload["mode"] = mode
 
         result = self._request(
             "POST", "/v1/ai/generate/video", json_data=payload
@@ -3310,6 +3526,7 @@ class AsyncFotoHub(_BaseClient):
             timeout=self.timeout,
         )
         _attach_aiwave(self)
+        _attach_media_jobs(self)
 
     async def _aiw(
         self,
@@ -3317,9 +3534,15 @@ class AsyncFotoHub(_BaseClient):
         path: str,
         body: Optional[dict[str, Any]] = None,
         params: Optional[dict[str, Any]] = None,
+        *,
+        retry_ambiguous: bool = True,
     ) -> Any:
-        """One AI Wave request -> parsed JSON (see `fotohub.aiwave`)."""
-        return (await self._request(method, path, json_data=body, params=params)).json()
+        """One namespace request -> parsed JSON (see `fotohub.aiwave`, `fotohub.media_jobs`)."""
+        return (
+            await self._request(
+                method, path, json_data=body, params=params, retry_ambiguous=retry_ambiguous
+            )
+        ).json()
 
     async def _aiw_wait(
         self,
@@ -3572,6 +3795,82 @@ class AsyncFotoHub(_BaseClient):
 
         raise TimeoutError(message=f"IDA Q 1.0 job {job_id} did not complete within {timeout}s")
 
+    async def generate_ida_q2(
+        self,
+        prompt: str,
+        *,
+        size_tier: str = "1K",
+        preset: str = "balanced",
+        aspect_ratio: str = "1:1",
+        num_images: int = 1,
+        transparent: Optional[bool] = None,
+        seed: Optional[int] = None,
+        style: Optional[str] = None,
+        palette: Optional[Union[str, list[str]]] = None,
+        layout: Optional[list[dict[str, Any]]] = None,
+        job_id: Optional[str] = None,
+        poll_interval: float = 5.0,
+        timeout: float = 900.0,
+    ) -> dict[str, Any]:
+        """Generate images with IDA Q Image 2, FOTOhub's proprietary image model, and wait.
+
+        Always asynchronous: the API answers 202 with a ``job_id`` and the job runs in a
+        queue. This method submits and polls ``GET /v1/ai/generate/image/ida-q-image-2/{job_id}``
+        until the job completes. The price depends on ``size_tier`` x ``preset`` (and
+        ``transparent``) times the image count; read it from ``GET /v1/pricing``. The
+        prepaid USD wallet is charged at submit and refunded automatically if the job fails.
+
+        Args:
+            prompt: What to render. Any language.
+            size_tier: ``"1K"`` (default), ``"HD"`` or ``"FULL"``.
+            preset: ``"fast"``, ``"balanced"`` (default) or ``"max"`` (``FULL`` has no ``max``).
+            aspect_ratio: e.g. ``"1:1"`` (default), ``"16:9"``, ``"4:5"``, ``"9:16"``. Not every
+                ratio is offered at every tier; the API answers 422 for an unoffered combination.
+            num_images: 1 up to the cap for the tier and preset (4 at 1K fast/balanced).
+            transparent: Ask for a transparent background (priced separately).
+            seed: Integer seed for reproducibility.
+            style: e.g. ``"photo"``, ``"poster"``, ``"typography"``, ``"illustration"``.
+            palette: A named palette (``"pastel"``, ``"neon"``, ...) or 1-8 ``"#RRGGBB"`` colours.
+            layout: Up to 12 boxes ``{"type": "obj" | "text", "box": {x, y, w, h}, "text"?, "desc"?}``
+                in output pixels.
+            job_id: A UUID that identifies the job. It is the idempotency key: a retry with the
+                same id returns the queued job and is never charged twice. Minted when omitted.
+            poll_interval: Seconds between status checks.
+            timeout: Maximum seconds to wait; the job keeps running when it is exceeded.
+
+        Returns:
+            Dict with ``images``, ``model``, ``job_id``, ``cost_usd``, ``billing`` and, when the
+            job reports them, ``result`` (``seed``, ``width``, ``height``, ...).
+
+        Raises:
+            RateLimitError: ``QUEUE_FULL`` (``retry_after``), ``TOO_MANY_ACTIVE`` or ``DAILY_LIMIT``
+                (``exc.code``). Nothing is charged.
+            AuthError: ``PLAN_REQUIRED``. ServerError: ``MODEL_DISABLED`` or ``TEMPORARY_ERROR``.
+            ValidationError: ``INVALID_REQUEST`` / ``CONTENT_POLICY``.
+            InsufficientFundsError: the wallet cannot cover it.
+            FotoHubError: the job failed (``exc.code`` is the job's ``error_code`` when present).
+            TimeoutError: the job did not finish within ``timeout``.
+        """
+        payload = _ida_q2_payload(
+            prompt, size_tier=size_tier, preset=preset, aspect_ratio=aspect_ratio,
+            num_images=num_images, transparent=transparent, seed=seed, style=style,
+            palette=palette, layout=layout, job_id=job_id,
+        )
+        job = (await self._request("POST", "/v1/ai/generate/image", json_data=payload)).json()
+        jid = str(job.get("job_id") or payload["job_id"])
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = (await self._request("GET", f"/v1/ai/generate/image/{IDA_Q2_MODEL}/{jid}")).json()
+            state = status.get("status")
+            if state == "completed":
+                return _ida_q2_result(job, status, jid)
+            if state in ("failed", "cancelled"):
+                raise _ida_q2_failure(status, jid)
+            await asyncio.sleep(poll_interval)
+
+        raise TimeoutError(message=f"IDA Q Image 2 job {jid} did not complete within {timeout}s")
+
     async def edit_image(
         self,
         image_url: str,
@@ -3619,6 +3918,7 @@ class AsyncFotoHub(_BaseClient):
         aspect_ratio: str = "16:9",
         image_url: Optional[str] = None,
         resolution: str = "1080p",
+        mode: Optional[str] = None,
         poll_interval: float = 5.0,
         timeout: float = 900.0,
     ) -> dict[str, Any]:
@@ -3642,6 +3942,9 @@ class AsyncFotoHub(_BaseClient):
             image_url: Reference image for image-to-video generation.
             resolution: Output resolution ("720p", "1080p", "4k"). ``sora-2-pro`` is
                 1080p-only: it is rendered and billed at 1080p whatever is sent.
+                Ignored by Kling V3 (``kling-v3``, ``kling-v3-omni``), which renders by ``mode``.
+            mode: Kling V3 only: ``"standard"`` (default, 720p) or ``"pro"`` (1080p).
+                Priced per second by mode; ``duration`` snaps to 5 or 10 s. Not sent when None.
             poll_interval: Seconds between polls, for the models that queue.
             timeout: How long to keep polling before giving up. The job itself
                 is unaffected and may still finish.
@@ -3667,6 +3970,8 @@ class AsyncFotoHub(_BaseClient):
         }
         if image_url is not None:
             payload["image_url"] = image_url
+        if mode is not None:
+            payload["mode"] = mode
 
         response = await self._request("POST", "/v1/ai/generate/video", json_data=payload)
         result = response.json()

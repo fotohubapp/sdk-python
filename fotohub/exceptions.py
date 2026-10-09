@@ -225,3 +225,85 @@ class VideoJobFailedError(FotoHubError):
         self.refunded = refunded
         self.current_save_rev = current_save_rev
         self.draft_id = draft_id
+
+
+class PriceChangedError(FotoHubError):
+    """Raised when the price moved away from the quote you confirmed (409 ``price_changed``).
+
+    Sent by the routes that take ``quote_credits`` (Upscale Pro video, the AI video routes):
+    the start was refused **before anything was charged**. Show :attr:`current_credits`
+    (or quote again), and resend with the new figure as ``quote_credits``. For the AI
+    video routes keep the same ``request_id``.
+    """
+
+    def __init__(
+        self,
+        message: str = "The price changed since it was shown.",
+        *,
+        quoted_credits: Optional[float] = None,
+        current_credits: Optional[float] = None,
+        billed_seconds: Optional[int] = None,
+        **kwargs: Any,
+    ) -> None:
+        kwargs.setdefault("code", "price_changed")
+        super().__init__(message, **kwargs)
+        #: The ``quote_credits`` you sent.
+        self.quoted_credits = quoted_credits
+        #: The price now, in the same unit.
+        self.current_credits = current_credits
+        #: Upscale Pro video only: the seconds the measured file is billed for.
+        self.billed_seconds = billed_seconds
+
+    @property
+    def charged(self) -> bool:
+        """Always ``False``: a refused start is never billed."""
+        return False
+
+
+class UrlBlockedError(ValidationError):
+    """Raised when a URL you passed was refused before any work (400 ``url_blocked``).
+
+    API-key callers must pass public ``https://`` URLs on the default port 443, without
+    credentials, whose host resolves to public addresses only. :attr:`field` names the
+    parameter (list items as ``image_urls[2]``); the URL is never echoed back. Nothing
+    was charged. A subclass of :class:`ValidationError`, so existing handlers still catch it.
+    ``code`` is ``url_blocked`` (or ``url_not_allowed`` for browser-session callers).
+    """
+
+    def __init__(
+        self,
+        message: str = "A URL in the request was refused.",
+        *,
+        field: Optional[str] = None,
+        charged: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        kwargs.setdefault("code", "url_blocked")
+        super().__init__(message, **kwargs)
+        #: The request parameter that carried the refused URL.
+        self.field = field
+        #: Always ``False`` in practice: the URL is checked before billing.
+        self.charged = charged
+
+
+class PricingNotConfiguredError(ServerError):
+    """Raised when the model has no price configured (``PRICING_NOT_CONFIGURED``).
+
+    The render was refused before any money moved and is never billed at a guessed
+    price. Usually 503; when the refusal comes from further down the pipeline the API
+    answers 424 with the code inside the message (also mapped here). Retrying does not
+    help until the price is configured; try another model or contact support.
+    """
+
+    def __init__(
+        self,
+        message: str = "This model has no price configured. You were not charged.",
+        **kwargs: Any,
+    ) -> None:
+        kwargs.setdefault("code", "PRICING_NOT_CONFIGURED")
+        super().__init__(message, **kwargs)
+
+    @property
+    def charged(self) -> bool:
+        """Always ``False``."""
+        return False
