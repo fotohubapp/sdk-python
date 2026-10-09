@@ -348,3 +348,131 @@ async def test_async_generate_ida_q2(aclient, rec, fast):
     out = await aclient.generate_ida_q2("a poster")
     assert out["images"] == ["u"]
     assert rec.body(0)["size_tier"] == "1K" and rec.body(0)["preset"] == "balanced"
+
+
+# ── review fixes ──────────────────────────────────────────────────────────────
+
+IDA_NOTE = "No credits were charged for this request."
+
+
+@pytest.mark.parametrize("status,detail,reason", [
+    (429, {"error": "The IDA Q queue is full. Try again shortly.", "code": "QUEUE_FULL", "charged": False,
+           "message": IDA_NOTE, "retry_after": 120}, "queue is full"),
+    (400, {"error": "Too many images for this resolution.", "code": "INVALID_REQUEST", "charged": False,
+           "message": "Your wallet was not charged for this request.", "max_images": 1}, "Too many images"),
+    (422, {"error": "num_images must be a whole number from 1 to 1 for HD / max.", "code": "INVALID_REQUEST",
+           "charged": False, "message": "Your wallet was not charged for this request."}, "num_images must be"),
+])
+def test_a_sentence_error_wins_over_the_no_charge_note(client, rec, status, detail, reason):
+    """IDA Q refusals: `error` is the reason, `message` the boilerplate; the message keeps both."""
+    rec.queue((status, {"detail": detail}))
+    with pytest.raises(FotoHubError) as ei:
+        client.generate_ida_q2("a poster", size_tier="HD", preset="max")
+    assert reason in ei.value.message
+    assert ei.value.message.endswith(detail["message"])
+    assert ei.value.code == detail["code"]
+
+
+def test_a_code_error_keeps_the_message_sentence(client, rec):
+    """price_changed / cputier shape: `error` is the code, `message` is the sentence."""
+    rec.queue((409, WAVE_409))
+    with pytest.raises(PriceChangedError) as ei:
+        client.ai_video.generate("a lighthouse", quote_credits=3.0)
+    assert ei.value.message == WAVE_409["detail"]["message"]
+    rec.queue((422, {"detail": {"error": "feature_off", "op": "x",
+                                "message": "This tool is not available yet. You were not charged."}}))
+    with pytest.raises(ValidationError) as ei:
+        client.ai_video.generate("a lighthouse")
+    assert ei.value.message == "This tool is not available yet. You were not charged."
+    assert ei.value.code == "feature_off"
+
+
+def test_a_sentence_error_without_message_is_used_as_is(client, rec):
+    rec.queue((403, {"detail": {"error": "Your plan does not include IDA Q Image 2.", "code": "PLAN_REQUIRED"}}))
+    with pytest.raises(AuthError) as ei:
+        client.generate_ida_q2("a poster")
+    assert ei.value.message == "Your plan does not include IDA Q Image 2."
+
+
+@pytest.mark.parametrize("body", [
+    {"detail": {"error": "Your plan's daily IDA Q image limit is used up.", "code": "DAILY_LIMIT",
+                "charged": False, "message": IDA_NOTE}},
+    {"detail": {"error": "You already have the maximum number of active IDA Q jobs.", "code": "TOO_MANY_ACTIVE",
+                "charged": False, "message": IDA_NOTE}},
+    {"error": {"code": "TOO_MANY_ACTIVE", "message": "You have too many jobs running or queued."}, "charged": False},
+])
+def test_daily_limit_and_too_many_active_are_not_retried(rec, fast, body):
+    c = _retrying(rec)
+    rec.queue((429, body, {"Retry-After": "30"}), (429, body), (429, body))
+    with pytest.raises(RateLimitError):
+        c.generate_ida_q2("a poster")
+    assert len(rec.requests) == 1
+
+
+def test_queue_full_is_still_retried(rec, fast):
+    c = _retrying(rec)
+    full = {"detail": {"error": "The IDA Q queue is full. Try again shortly.", "code": "QUEUE_FULL",
+                       "charged": False, "message": IDA_NOTE, "retry_after": 30}}
+    rec.queue((429, full, {"Retry-After": "30"}), (202, {"job_id": JID, "status": "queued"}),
+              (200, {"job_id": JID, "status": "completed", "images": ["u"]}))
+    assert c.generate_ida_q2("a poster", job_id=JID)["images"] == ["u"]
+    assert rec.body(0)["job_id"] == rec.body(1)["job_id"] == JID
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), -1.0, True, "12"])
+def test_bad_quote_credits_is_refused_before_any_request(client, rec, bad):
+    calls = [
+        lambda: client.upscale_pro.video("https://example.com/c.mp4", quote_credits=bad),
+        lambda: client.ai_video.generate("a lighthouse", quote_credits=bad),
+        lambda: client.ai_video.avatar("https://example.com/p.png", consent={"accepted": True}, script="hi", quote_credits=bad),
+        lambda: client.ai_video.dub("https://example.com/c.mp4", ["de"], quote_credits=bad),
+    ]
+    for call in calls:
+        with pytest.raises(ValidationError) as ei:
+            call()
+        assert "quote_credits" in ei.value.message
+    assert rec.requests == []
+
+
+async def test_async_bad_quote_credits_is_refused(aclient, rec):
+    with pytest.raises(ValidationError):
+        await aclient.ai_video.generate("a lighthouse", quote_credits=float("nan"))
+    assert rec.requests == []
+
+
+def test_zero_and_integer_quote_credits_are_sent(client, rec):
+    client.ai_video.generate("a lighthouse", quote_credits=0)
+    assert rec.body()["quote_credits"] == 0
+    client.upscale_pro.video("https://example.com/c.mp4", quote_credits=12)
+    assert rec.body()["quote_credits"] == 12
+
+
+@pytest.mark.parametrize("quote", [
+    {"flag_on": True, "available": True, "eligible": True, "credits": None},  # wallet-only price
+    {"flag_on": True, "available": False, "reason": "engine_unavailable"},    # no credits key at all
+    {"available": False, "reason": "feature_disabled", "flag_on": False},
+])
+def test_the_module_example_survives_a_quote_without_credits(client, rec, quote):
+    """The documented flow must not KeyError: `credits` is null (wallet pays) or absent."""
+    import textwrap
+    from fotohub import media_jobs
+
+    doc = media_jobs.__doc__
+    block = doc.split("::", 1)[1].strip("\n").split("\n\n", 1)[0]
+    rec.queue((200, quote), (202, {"job_id": JID, "status": "queued"}))
+    scope = {"FotoHub": lambda **_k: client}
+    exec(textwrap.dedent(block).replace("done = client.upscale_pro.wait_for_job", "_ = (lambda *_a: None)"), scope)
+    if quote.get("available"):
+        assert rec.requests[1].url.path == "/v1/upscale/pro/video"
+        assert "quote_credits" not in rec.body(1)
+    else:
+        assert len(rec.requests) == 1
+
+
+@pytest.mark.parametrize("status,cls", [(400, ValidationError), (422, ValidationError), (500, ServerError),
+                                        (418, FotoHubError)])
+def test_a_json_array_error_body_is_handled(client, rec, status, cls):
+    rec.queue((status, [{"msg": "bad"}, "x"]))
+    with pytest.raises(cls) as ei:
+        client.ai_video.get(JID)
+    assert ei.value.status_code == status

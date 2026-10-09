@@ -4,8 +4,10 @@
 
     client = FotoHub(api_key="...")
     q = client.upscale_pro.quote("video", width=1280, height=720, fps=30, seconds=18)
-    job = client.upscale_pro.video("https://example.com/clip.mp4", quote_credits=q["credits"])
-    done = client.upscale_pro.wait_for_job(job["job_id"])
+    if q["available"]:
+        # ``credits`` is null when the wallet pays (no credit price); None skips the check.
+        job = client.upscale_pro.video("https://example.com/clip.mp4", quote_credits=q.get("credits"))
+        done = client.upscale_pro.wait_for_job(job["job_id"])
 
     out = client.ai_video.generate("A lighthouse at dusk, waves rolling in")
     video = client.ai_video.wait_for_job(out["job"]["id"])
@@ -20,9 +22,26 @@ when the price moved; omit it and no check is made.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping, Optional, Sequence
 
 from .aiwave import JOB_TERMINAL, ProgressCallback, _body, _Namespace, _request_id
+from .exceptions import ValidationError
+
+
+def _quote_credits(value: Any) -> Optional[float]:
+    """``quote_credits`` checked before any request: ``None`` (no price check) or a finite number >= 0.
+
+    A NaN would fail JSON encoding with a bare ``ValueError``; a negative or infinite figure can never
+    match a price. Either way it is the caller's mistake, so it is refused here, nothing sent.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValidationError(f"quote_credits must be a number, got {type(value).__name__}")
+    if not math.isfinite(value) or value < 0:
+        raise ValidationError(f"quote_credits must be a finite number >= 0, got {value!r}")
+    return value
 
 
 class UpscalePro(_Namespace):
@@ -100,7 +119,7 @@ class UpscalePro(_Namespace):
         """
         body = _body(
             video_url=video_url, scale=scale, start_seconds=start_seconds, max_seconds=max_seconds,
-            quote_credits=quote_credits, client_ref=dict(client_ref) if client_ref is not None else None,
+            quote_credits=_quote_credits(quote_credits), client_ref=dict(client_ref) if client_ref is not None else None,
         )
         return self._client._aiw("POST", f"{self._BASE}/video", body, None, retry_ambiguous=False)
 
@@ -174,7 +193,7 @@ class AiVideo(_Namespace):
             request_id: Your UUID for this run; minted when omitted.
         """
         body = _body(model=self.MOTION_MODEL, prompt=prompt, image=image, duration=duration,
-                     resolution=resolution, seed=seed, quote_credits=quote_credits)
+                     resolution=resolution, seed=seed, quote_credits=_quote_credits(quote_credits))
         body["request_id"] = _request_id(request_id)
         return self._run("POST", "/v1/video/generations", body)
 
@@ -212,7 +231,7 @@ class AiVideo(_Namespace):
         """
         body = _body(portrait=portrait, consent=dict(consent), mode=mode, audio=audio, script=script,
                      language=language, voice_ref=voice_ref, voice_consent=voice_consent, prompt=prompt,
-                     gesture=gesture, seed=seed, quote_credits=quote_credits)
+                     gesture=gesture, seed=seed, quote_credits=_quote_credits(quote_credits))
         body["request_id"] = _request_id(request_id)
         return self._run("POST", "/v1/video/avatar", body)
 
@@ -246,7 +265,7 @@ class AiVideo(_Namespace):
             source=source, languages=list(languages), source_language=source_language,
             glossary=list(glossary) if glossary is not None else None, voice_ref=voice_ref,
             voice_consent=dict(voice_consent) if voice_consent is not None else None,
-            quote_credits=quote_credits,
+            quote_credits=_quote_credits(quote_credits),
         )
         body["request_id"] = _request_id(request_id)
         return self._run("POST", "/v1/video/dub", body)

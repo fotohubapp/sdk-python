@@ -837,6 +837,10 @@ Please ensure all tests pass and type checks are clean before submitting a pull 
 - `client.ai_video`: `generate`, `avatar`, `dub`, `get`, `wait_for_job`, with
   `quote_credits` and an automatic `request_id`.
 - `generate_ida_q2(...)`: IDA Q Image 2, submit and poll.
+- Error messages keep the server's reason (`detail.error`) ahead of the no-charge note;
+  429 `DAILY_LIMIT` / `TOO_MANY_ACTIVE` are raised at once, not retried; `quote_credits`
+  that is NaN, infinite, negative or not a number raises `ValidationError` before any
+  request; a JSON-array error body no longer raises `AttributeError`.
 
 ### 1.12.0
 

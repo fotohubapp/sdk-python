@@ -152,6 +152,25 @@ def _as_float(value: Any) -> Optional[float]:
     return None
 
 
+def _detail_message(detail: dict[str, Any], fallback: str) -> str:
+    """The human message of a dict ``detail``, picked by the body's shape.
+
+    api-server sends two shapes with both keys. When ``error`` is a machine code
+    (``price_changed``, ``url_blocked``, ``feature_off``) the sentence is ``message``.
+    When ``error`` is itself a sentence (the IDA Q refusals: ``QUEUE_FULL``,
+    ``INVALID_REQUEST``, ...) it is the real reason and ``message`` is only the
+    no-charge note, so the note is appended rather than allowed to replace it.
+    """
+    error = detail.get("error")
+    message = detail.get("message")
+    if isinstance(error, str) and error.strip() and not _CODE_LIKE.match(error):
+        if isinstance(message, str) and message.strip() and message not in error:
+            sep = " " if error.rstrip()[-1:] in ".!?" else ". "
+            return f"{error.rstrip()}{sep}{message.strip()}"
+        return error
+    return str(message or error or detail.get("detail") or fallback)
+
+
 def _extract_error(body: Any, fallback: str) -> tuple[str, dict[str, Any]]:
     """Pull a human message and any structured fields out of an error body.
 
@@ -170,13 +189,7 @@ def _extract_error(body: Any, fallback: str) -> tuple[str, dict[str, Any]]:
 
     detail = body.get("detail")
     if isinstance(detail, dict):
-        message = (
-            detail.get("message")
-            or detail.get("error")
-            or detail.get("detail")
-            or fallback
-        )
-        return str(message), detail
+        return _detail_message(detail, fallback), detail
     if isinstance(detail, list):
         # FastAPI request-validation errors: [{"loc": [...], "msg": ..., ...}]
         msgs = [
@@ -204,6 +217,10 @@ _CODE_LIKE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 #: 503 answers that are a decision, not an outage: repeating the call cannot change them.
 _FINAL_503_CODES = frozenset({"PRICING_NOT_CONFIGURED", "MODEL_DISABLED"})
 
+#: 429 answers a retry within seconds cannot change: a used-up daily cap, or the caller's own
+#: jobs filling every slot (it clears only when one of them finishes). ``QUEUE_FULL`` is retried.
+_FINAL_429_CODES = frozenset({"DAILY_LIMIT", "TOO_MANY_ACTIVE"})
+
 #: The IDA Q Image 2 model id; always asynchronous (202 + poll).
 IDA_Q2_MODEL = "ida-q-image-2"
 
@@ -225,6 +242,19 @@ def _detail_code(body: Any) -> Optional[str]:
     if isinstance(err, str) and _CODE_LIKE.match(err):
         return err
     return None
+
+
+def _response_error_code(response: httpx.Response) -> Optional[str]:
+    """The machine code of an error response: ``detail`` first, then the ``{"error": {"code"}}`` envelope."""
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    code = _detail_code(body)
+    if code is None and isinstance(body, dict) and isinstance(body.get("error"), dict):
+        env = body["error"].get("code")
+        code = env if isinstance(env, str) else None
+    return code
 
 
 def _response_detail_code(response: httpx.Response) -> Optional[str]:
@@ -572,7 +602,11 @@ class _BaseClient:
                 message=message,
                 status_code=status,
                 response_body=body,
-                errors=fields.get("errors") or (body.get("detail") if isinstance(body.get("detail"), list) else None),
+                errors=fields.get("errors") or (
+                    body.get("detail")
+                    if isinstance(body, dict) and isinstance(body.get("detail"), list)
+                    else None
+                ),
             )
         elif status >= 500:
             raise ServerError(message=message, status_code=status, response_body=body)
@@ -604,7 +638,8 @@ class _BaseClient:
         if status_code == 409:
             return idempotent and _is_idempotency_in_progress(response)
         if status_code == 429:
-            return True
+            # A daily cap or a full set of running jobs does not clear in seconds.
+            return _response_error_code(response) not in _FINAL_429_CODES
         if status_code == 503 and _response_detail_code(response) in _FINAL_503_CODES:
             return False
         return retry_ambiguous and status_code in (500, 502, 503, 504)
